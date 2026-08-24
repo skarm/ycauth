@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -106,15 +107,16 @@ func TestSourceAcquireResponseValidation(t *testing.T) {
 	_, document := testKey()
 	now := time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)
 	responseCases := []struct {
-		name string
-		body string
+		name      string
+		body      string
+		wantError string
 	}{
-		{name: "malformed JSON", body: `{`},
-		{name: "missing fields", body: `{}`},
-		{name: "expired", body: `{"iamToken":"token","expiresAt":` + strconv.Quote(now.Add(-time.Second).Format(time.RFC3339Nano)) + `}`},
-		{name: "oversized", body: strings.Repeat("x", int(maxResponseBodySize)+1)},
+		{name: "malformed JSON", body: `{`, wantError: "unexpected end of JSON input"},
+		{name: "missing fields", body: `{}`, wantError: "token is empty"},
+		{name: "expired", body: `{"iamToken":"token","expiresAt":` + strconv.Quote(now.Add(-time.Second).Format(time.RFC3339Nano)) + `}`, wantError: "token expired at"},
+		{name: "oversized", body: strings.Repeat("x", int(maxResponseBodySize)+1), wantError: "JSON exceeds"},
 		{name: "implausible lifetime", body: `{"iamToken":"token","expiresAt":` +
-			strconv.Quote(now.Add(30*24*time.Hour).Format(time.RFC3339Nano)) + `}`},
+			strconv.Quote(now.Add(30*24*time.Hour).Format(time.RFC3339Nano)) + `}`, wantError: "exceeds the maximum lifetime"},
 	}
 	for _, testCase := range responseCases {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -129,10 +131,68 @@ func TestSourceAcquireResponseValidation(t *testing.T) {
 				t.Fatalf("NewJSON() error = %v", err)
 			}
 			source.now = func() time.Time { return now }
-			if _, err := source.Acquire(context.Background()); err == nil {
-				t.Fatal("Acquire() error = nil")
+			if _, err := source.Acquire(context.Background()); err == nil || !strings.Contains(err.Error(), testCase.wantError) {
+				t.Fatalf("Acquire() error = %v, want containing %q", err, testCase.wantError)
 			}
 		})
+	}
+}
+
+func TestSourceAcquireAllowsMaximumLifetimeWithClockSkew(t *testing.T) {
+	t.Parallel()
+
+	_, document := testKey()
+	now := time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)
+	expiresAt := now.Add(maxTokenLifetime + maxExpirationClockSkew)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(writer, `{"iamToken":"iam-token","expiresAt":`+strconv.Quote(expiresAt.Format(time.RFC3339Nano))+`}`)
+	}))
+	defer server.Close()
+
+	source, err := NewJSON(bytes.NewReader(document), WithEndpoint(server.URL), WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewJSON() error = %v", err)
+	}
+	source.now = func() time.Time { return now }
+
+	token, err := source.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("Acquire() error = %v", err)
+	}
+	if token.Value != "iam-token" || !token.ExpiresAt.Equal(expiresAt) {
+		t.Fatalf("Acquire() = %v", token)
+	}
+}
+
+func TestSourceAcquireRetriesInvalidSuccessfulResponse(t *testing.T) {
+	t.Parallel()
+
+	_, document := testKey()
+	now := time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)
+	expiresAt := now.Add(time.Hour)
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		if requests.Add(1) == 1 {
+			_, _ = io.WriteString(writer, `{}`)
+			return
+		}
+
+		_, _ = io.WriteString(writer, `{"iamToken":"iam-token","expiresAt":`+strconv.Quote(expiresAt.Format(time.RFC3339Nano))+`}`)
+	}))
+	defer server.Close()
+
+	source, err := NewJSON(bytes.NewReader(document), WithEndpoint(server.URL), WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewJSON() error = %v", err)
+	}
+	source.now = func() time.Time { return now }
+
+	token, err := source.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("Acquire() error = %v", err)
+	}
+	if token.Value != "iam-token" || !token.ExpiresAt.Equal(expiresAt) || requests.Load() != 2 {
+		t.Fatalf("Acquire() = %v after %d requests", token, requests.Load())
 	}
 }
 
@@ -154,7 +214,9 @@ func TestSourceAcquireAPIError(t *testing.T) {
 	t.Parallel()
 
 	_, document := testKey()
+	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
 		writer.Header().Set("Retry-After", "7")
 		writer.Header().Set("X-Request-Id", "request-id")
 		http.Error(writer, "unavailable", http.StatusServiceUnavailable)
@@ -172,6 +234,9 @@ func TestSourceAcquireAPIError(t *testing.T) {
 	}
 	if !apiErr.Temporary() || apiErr.RetryAfter != 7*time.Second || apiErr.RequestID != "request-id" {
 		t.Fatalf("APIError = %#v", apiErr)
+	}
+	if requests.Load() != 1 {
+		t.Fatalf("requests = %d, want 1 because HTTP errors must use caller backoff", requests.Load())
 	}
 }
 

@@ -39,6 +39,10 @@ const (
 	// maxTokenLifetime rejects an implausible expiration: IAM tokens live for
 	// hours, so a lifetime beyond 12 hours means the response cannot be trusted.
 	maxTokenLifetime = 12 * time.Hour
+	// maxExpirationClockSkew prevents an exactly 12-hour IAM token from being
+	// rejected when the IAM service clock is slightly ahead of the client clock.
+	// It is deliberately small so the upper lifetime bound remains meaningful.
+	maxExpirationClockSkew = time.Minute
 )
 
 // Option configures a [Source] created by [NewFile] or [NewJSON].
@@ -165,49 +169,73 @@ func NewJSON(r io.Reader, option ...Option) (*Source, error) {
 }
 
 // Acquire signs a fresh JWT and exchanges it for an IAM token. It honors ctx
-// during the HTTP exchange.
+// during the HTTP exchange. A malformed or semantically invalid successful
+// response is retried once; transport and non-success HTTP errors are returned
+// to the caller so its backoff policy remains authoritative.
 func (s *Source) Acquire(ctx context.Context) (ycauth.Token, error) {
+	token, retry, err := s.acquireOnce(ctx)
+	if err == nil || !retry {
+		return token, err
+	}
+
+	token, _, err = s.acquireOnce(ctx)
+
+	return token, err
+}
+
+// acquireOnce reports retry=true only after an HTTP 200 response whose body
+// could not be decoded or did not contain a usable token.
+func (s *Source) acquireOnce(ctx context.Context) (ycauth.Token, bool, error) {
 	signed, err := s.signedJWT(s.now().UTC())
 	if err != nil {
-		return ycauth.Token{}, err
+		return ycauth.Token{}, false, err
 	}
 
 	// #nosec G117 -- the IAM API requires the signed JWT in this request field.
 	body, err := json.Marshal(tokenRequest{JWT: signed})
 	if err != nil {
-		return ycauth.Token{}, fmt.Errorf("marshal IAM token request: %w", err)
+		return ycauth.Token{}, false, fmt.Errorf("marshal IAM token request: %w", err)
 	}
 
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, s.endpoint, bytes.NewReader(body))
 	if err != nil {
-		return ycauth.Token{}, fmt.Errorf("create IAM token request: %w", err)
+		return ycauth.Token{}, false, fmt.Errorf("create IAM token request: %w", err)
 	}
 
 	httpx.SetJSONHeaders(request, s.userAgent)
 
 	response, err := s.client.Do(request)
 	if err != nil {
-		return ycauth.Token{}, fmt.Errorf("exchange service-account JWT for IAM token: %w", err)
+		return ycauth.Token{}, false, fmt.Errorf("exchange service-account JWT for IAM token: %w", err)
 	}
 	defer func() { _ = response.Body.Close() }()
 
 	if response.StatusCode != http.StatusOK {
-		return ycauth.Token{}, httpx.ResponseError("exchange service-account JWT for IAM token", response, s.now())
+		return ycauth.Token{}, false, httpx.ResponseError("exchange service-account JWT for IAM token", response, s.now())
 	}
 
 	var result tokenResponse
 	if err := httpx.DecodeJSON(response.Body, maxResponseBodySize, &result); err != nil {
-		return ycauth.Token{}, fmt.Errorf("decode IAM token response: %w", err)
+		return ycauth.Token{}, true, fmt.Errorf("decode IAM token response: %w", err)
 	}
 
 	now := s.now()
 	token := ycauth.Token{Value: result.IAMToken, ExpiresAt: result.ExpiresAt}
 
-	if !token.ValidAt(now) || token.ExpiresAt.After(now.Add(maxTokenLifetime)) {
-		return ycauth.Token{}, errors.New("decode IAM token response: token is empty or its expiration is out of range")
+	switch {
+	case token.Value == "":
+		return ycauth.Token{}, true, errors.New("decode IAM token response: token is empty")
+	case !token.ExpiresAt.After(now):
+		return ycauth.Token{}, true, fmt.Errorf("decode IAM token response: token expired at %s", token.ExpiresAt.Format(time.RFC3339Nano))
+	case token.ExpiresAt.After(now.Add(maxTokenLifetime + maxExpirationClockSkew)):
+		return ycauth.Token{}, true, fmt.Errorf(
+			"decode IAM token response: expiration %s exceeds the maximum lifetime relative to client time %s",
+			token.ExpiresAt.Format(time.RFC3339Nano),
+			now.Format(time.RFC3339Nano),
+		)
 	}
 
-	return token, nil
+	return token, false, nil
 }
 
 // signedJWT creates the short-lived PS256 assertion required by IAM.
