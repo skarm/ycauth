@@ -7,4 +7,4 @@ require (
 	github.com/skarm/ycauth v0.1.0
 )
 
-require github.com/aws/smithy-go v1.27.8 // indirect
+require github.com/aws/smithy-go v1.27.9 // indirect
