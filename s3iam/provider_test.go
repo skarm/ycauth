@@ -302,7 +302,7 @@ func TestIssuerResponseValidation(t *testing.T) {
 	}
 }
 
-func TestIssuerRejectsCredentialsBeyondRequestedOrTokenLifetime(t *testing.T) {
+func TestIssuerAcceptsServiceExpirationBeyondRequestedLifetime(t *testing.T) {
 	t.Parallel()
 
 	now := time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)
@@ -311,53 +311,62 @@ func TestIssuerRejectsCredentialsBeyondRequestedOrTokenLifetime(t *testing.T) {
 		t.Fatalf("PrefixPolicy() error = %v", err)
 	}
 
-	testCases := []struct {
-		name              string
-		duration          time.Duration
-		tokenExpiresAt    time.Time
-		responseExpiresAt time.Time
-	}{
-		{
-			name:              "requested duration",
-			duration:          30 * time.Minute,
-			tokenExpiresAt:    now.Add(2 * time.Hour),
-			responseExpiresAt: now.Add(31 * time.Minute),
-		},
-		{
-			name:              "IAM token lifetime",
-			duration:          time.Hour,
-			tokenExpiresAt:    now.Add(20 * time.Minute),
-			responseExpiresAt: now.Add(21 * time.Minute),
-		},
+	responseExpiresAt := now.Add(time.Hour)
+	body := `{"accessKeyId":"access","secret":"secret","sessionToken":"token","expiresAt":` +
+		strconv.Quote(responseExpiresAt.Format(time.RFC3339Nano)) + `}`
+	client := &http.Client{Transport: transportFunc(func(*http.Request) (*http.Response, error) {
+		return jsonResponse(http.StatusOK, body), nil
+	})}
+	provider, _, err := newCredentialsIssuer(ycauth.TokenProviderFunc(func(context.Context) (ycauth.Token, error) {
+		return ycauth.Token{Value: "iam", ExpiresAt: now.Add(2 * time.Hour)}, nil
+	}), Config{
+		SessionName:   "session",
+		Duration:      30 * time.Minute,
+		SessionPolicy: policy,
+		Endpoint:      "https://iam.example.test",
+		HTTPClient:    client,
+	})
+	if err != nil {
+		t.Fatalf("newCredentialsIssuer() error = %v", err)
 	}
+	provider.now = func() time.Time { return now }
 
-	for _, testCase := range testCases {
-		t.Run(testCase.name, func(t *testing.T) {
-			t.Parallel()
+	credentials, err := provider.Retrieve(context.Background())
+	if err != nil || !credentials.Expires.Equal(responseExpiresAt) {
+		t.Fatalf("Retrieve() = (%#v, %v)", credentials, err)
+	}
+}
 
-			body := `{"accessKeyId":"access","secret":"secret","sessionToken":"token","expiresAt":` +
-				strconv.Quote(testCase.responseExpiresAt.Format(time.RFC3339Nano)) + `}`
-			client := &http.Client{Transport: transportFunc(func(*http.Request) (*http.Response, error) {
-				return jsonResponse(http.StatusOK, body), nil
-			})}
-			provider, _, err := newCredentialsIssuer(ycauth.TokenProviderFunc(func(context.Context) (ycauth.Token, error) {
-				return ycauth.Token{Value: "iam", ExpiresAt: testCase.tokenExpiresAt}, nil
-			}), Config{
-				SessionName:   "session",
-				Duration:      testCase.duration,
-				SessionPolicy: policy,
-				Endpoint:      "https://iam.example.test",
-				HTTPClient:    client,
-			})
-			if err != nil {
-				t.Fatalf("newCredentialsIssuer() error = %v", err)
-			}
-			provider.now = func() time.Time { return now }
+func TestIssuerRejectsCredentialsBeyondTokenLifetime(t *testing.T) {
+	t.Parallel()
 
-			if _, err := provider.Retrieve(context.Background()); err == nil {
-				t.Fatal("Retrieve() error = nil")
-			}
-		})
+	now := time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)
+	policy, err := PrefixPolicy("bucket", "", PermissionReadObject)
+	if err != nil {
+		t.Fatalf("PrefixPolicy() error = %v", err)
+	}
+	tokenExpiresAt := now.Add(20 * time.Minute)
+	body := `{"accessKeyId":"access","secret":"secret","sessionToken":"token","expiresAt":` +
+		strconv.Quote(tokenExpiresAt.Add(time.Nanosecond).Format(time.RFC3339Nano)) + `}`
+	client := &http.Client{Transport: transportFunc(func(*http.Request) (*http.Response, error) {
+		return jsonResponse(http.StatusOK, body), nil
+	})}
+	provider, _, err := newCredentialsIssuer(ycauth.TokenProviderFunc(func(context.Context) (ycauth.Token, error) {
+		return ycauth.Token{Value: "iam", ExpiresAt: tokenExpiresAt}, nil
+	}), Config{
+		SessionName:   "session",
+		Duration:      time.Hour,
+		SessionPolicy: policy,
+		Endpoint:      "https://iam.example.test",
+		HTTPClient:    client,
+	})
+	if err != nil {
+		t.Fatalf("newCredentialsIssuer() error = %v", err)
+	}
+	provider.now = func() time.Time { return now }
+
+	if _, err := provider.Retrieve(context.Background()); err == nil {
+		t.Fatal("Retrieve() error = nil")
 	}
 }
 

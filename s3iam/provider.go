@@ -95,7 +95,6 @@ type credentialsIssuer struct {
 	endpoint       string
 	userAgent      string
 	refreshTimeout time.Duration
-	duration       time.Duration
 	// requestBody is constant for the issuer lifetime, so construction encodes it
 	// once instead of on every refresh.
 	requestBody  []byte
@@ -220,7 +219,6 @@ func newCredentialsIssuer(tokenProvider ycauth.TokenProvider, config Config) (*c
 		endpoint:       endpoint,
 		userAgent:      httpx.UserAgent(config.UserAgent),
 		refreshTimeout: refreshTimeout,
-		duration:       duration,
 		requestBody:    requestBody,
 		now:            time.Now,
 		jitterSource:   rand.Float64,
@@ -298,20 +296,19 @@ func (p *credentialsIssuer) Retrieve(ctx context.Context) (credentials aws.Crede
 		return aws.Credentials{}, p.recordFailure(errors.New("decode ephemeral S3 credentials response: required fields are missing"))
 	}
 
-	// The service may shorten the requested lifetime, but credentials must not
-	// outlive either that request or the IAM token which authorized it.
+	// ExpiresAt is authoritative. Duration is a requested lifetime, not a
+	// client-side upper bound guaranteed by the API. The service does guarantee
+	// that credentials do not outlive the IAM token which authorized them.
 	now := p.now()
-
-	latestExpiresAt := now.Add(p.duration)
-
 	tokenExpiresAt := token.ExpiresAt.Round(0)
-	if tokenExpiresAt.Before(latestExpiresAt) {
-		latestExpiresAt = tokenExpiresAt
-	}
 
-	if !result.ExpiresAt.After(now) || result.ExpiresAt.After(latestExpiresAt) {
-		return aws.Credentials{}, p.recordFailure(
-			errors.New("decode ephemeral S3 credentials response: expiration is out of range"))
+	if !result.ExpiresAt.After(now) || result.ExpiresAt.After(tokenExpiresAt) {
+		return aws.Credentials{}, p.recordFailure(fmt.Errorf(
+			"decode ephemeral S3 credentials response: expiration %s is outside (%s, %s]",
+			result.ExpiresAt.Format(time.RFC3339Nano),
+			now.Format(time.RFC3339Nano),
+			tokenExpiresAt.Format(time.RFC3339Nano),
+		))
 	}
 
 	issued := aws.Credentials{
