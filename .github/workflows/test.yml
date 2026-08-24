@@ -24,7 +24,7 @@ jobs:
         working-directory: ${{ matrix.module }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version: ${{ matrix.go }}
           cache-dependency-path: ${{ matrix.module }}/go.sum
@@ -49,7 +49,7 @@ jobs:
         module: [".", "s3iam", "pgxiam"]
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.25.x"
           cache-dependency-path: ${{ matrix.module }}/go.sum
@@ -70,7 +70,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.25.x"
           cache-dependency-path: go.sum
@@ -108,7 +108,7 @@ jobs:
         working-directory: s3iam
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.25.x"
           cache-dependency-path: s3iam/go.sum
@@ -126,7 +126,7 @@ jobs:
         working-directory: pgxiam
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.25.x"
           cache-dependency-path: pgxiam/go.sum
