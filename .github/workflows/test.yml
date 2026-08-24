@@ -23,7 +23,7 @@ jobs:
       run:
         working-directory: ${{ matrix.module }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ matrix.go }}
@@ -34,7 +34,7 @@ jobs:
       - run: go build ./...
       - run: go vet ./...
       - run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: coverage-${{ matrix.module }}-${{ matrix.go }}
           path: ${{ matrix.module }}/coverage.out
@@ -48,7 +48,7 @@ jobs:
       matrix:
         module: [".", "s3iam", "pgxiam"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v5
         with:
           go-version: "1.25.x"
@@ -57,7 +57,7 @@ jobs:
         if: matrix.module != '.'
         working-directory: ${{ matrix.module }}
         run: go mod edit -replace github.com/skarm/ycauth=..
-      - uses: golangci/golangci-lint-action@v8
+      - uses: golangci/golangci-lint-action@v9
         with:
           version: v2.13.1
           working-directory: ${{ matrix.module }}
@@ -69,8 +69,8 @@ jobs:
     name: fuzz smoke
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.25.x"
           cache-dependency-path: go.sum
@@ -107,8 +107,8 @@ jobs:
       run:
         working-directory: s3iam
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.25.x"
           cache-dependency-path: s3iam/go.sum
@@ -125,8 +125,8 @@ jobs:
       run:
         working-directory: pgxiam
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.25.x"
           cache-dependency-path: pgxiam/go.sum
