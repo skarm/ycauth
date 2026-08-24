@@ -1,0 +1,136 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  GOWORK: "off"
+
+jobs:
+  test:
+    name: test (${{ matrix.module }}, go${{ matrix.go }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [".", "s3iam", "pgxiam"]
+        go: ["1.25.x", "1.26.x"]
+    defaults:
+      run:
+        working-directory: ${{ matrix.module }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache-dependency-path: ${{ matrix.module }}/go.sum
+      - name: Resolve the root module from the working tree
+        if: matrix.module != '.'
+        run: go mod edit -replace github.com/skarm/ycauth=..
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.module }}-${{ matrix.go }}
+          path: ${{ matrix.module }}/coverage.out
+          if-no-files-found: error
+
+  lint:
+    name: lint (${{ matrix.module }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [".", "s3iam", "pgxiam"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+          cache-dependency-path: ${{ matrix.module }}/go.sum
+      - name: Resolve the root module from the working tree
+        if: matrix.module != '.'
+        working-directory: ${{ matrix.module }}
+        run: go mod edit -replace github.com/skarm/ycauth=..
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.13.1
+          working-directory: ${{ matrix.module }}
+      - name: Check formatting
+        working-directory: ${{ matrix.module }}
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+
+  fuzz:
+    name: fuzz smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+          cache-dependency-path: go.sum
+      - name: Run every fuzz target briefly
+        run: |
+          set -euo pipefail
+          for target in FuzzRetryAfter FuzzResponseError; do
+            go test -run=xxx -fuzz="^${target}$" -fuzztime=30s ./internal/httpx/
+          done
+          for target in FuzzParsePrivateKey FuzzNewJSON; do
+            go test -run=xxx -fuzz="^${target}$" -fuzztime=30s ./authzkey/
+          done
+      - name: Run the s3iam fuzz targets
+        working-directory: s3iam
+        run: |
+          set -euo pipefail
+          go mod edit -replace github.com/skarm/ycauth=..
+          for target in FuzzRawPolicy FuzzPrefixPolicy; do
+            go test -run=xxx -fuzz="^${target}$" -fuzztime=30s .
+          done
+      - name: Fail if fuzzing produced a crasher
+        run: |
+          if find . -path '*/testdata/fuzz/*' -type f | grep -q .; then
+            echo "fuzzing wrote a failing input:"
+            find . -path '*/testdata/fuzz/*' -type f -exec sh -c 'echo "--- $1"; cat "$1"' _ {} \;
+            exit 1
+          fi
+
+  standalone-s3iam:
+    name: released dependency (s3iam)
+    if: startsWith(github.ref, 'refs/tags/s3iam/v')
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: s3iam
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+          cache-dependency-path: s3iam/go.sum
+      - run: go mod tidy -diff
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test -race ./...
+
+  standalone-pgxiam:
+    name: released dependency (pgxiam)
+    if: startsWith(github.ref, 'refs/tags/pgxiam/v')
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: pgxiam
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+          cache-dependency-path: pgxiam/go.sum
+      - run: go mod tidy -diff
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test -race ./...

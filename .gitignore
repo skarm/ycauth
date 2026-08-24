@@ -1,0 +1,11 @@
+.idea/
+.DS_Store
+.vscode/
+*.test
+coverage.out
+dist/
+
+# Workspaces hide missing version tags and make local builds diverge from
+# what consumers resolve. Keep them local.
+go.work
+go.work.sum
