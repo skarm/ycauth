@@ -57,7 +57,7 @@ jobs:
         if: matrix.module != '.'
         working-directory: ${{ matrix.module }}
         run: go mod edit -replace github.com/skarm/ycauth=..
-      - uses: golangci/golangci-lint-action@v8
+      - uses: golangci/golangci-lint-action@v9
         with:
           version: v2.13.1
           working-directory: ${{ matrix.module }}
