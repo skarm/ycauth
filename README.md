@@ -4,16 +4,13 @@
 
 `ycauth` provides small Go modules for applications that use short-lived Yandex
 Cloud IAM tokens. It includes token sources, a concurrency-safe cache,
-ephemeral Object Storage credentials for AWS SDK v2, and IAM authentication for
-new pgx v5 connections.
+and ephemeral Object Storage credentials for AWS SDK v2.
 
 Use only the modules your application needs:
 
 - `github.com/skarm/ycauth` — token sources and `Cache`.
 - `github.com/skarm/ycauth/s3iam` — temporary Object Storage credentials for
   AWS SDK for Go v2.
-- `github.com/skarm/ycauth/pgxiam` — IAM authentication for new pgx physical
-  connections.
 
 All modules require Go 1.25 or later. Add a released version of each required
 module to `go.mod`:
@@ -21,7 +18,6 @@ module to `go.mod`:
 ```bash
 go get github.com/skarm/ycauth@<version>
 go get github.com/skarm/ycauth/s3iam@<version> # Object Storage only
-go get github.com/skarm/ycauth/pgxiam@<version> # PostgreSQL only
 ```
 
 ## Architecture
@@ -30,12 +26,12 @@ go get github.com/skarm/ycauth/pgxiam@<version> # PostgreSQL only
 imds.Source or authzkey.Source
                 │
                 ▼
-            ycauth.Cache ──── TokenProvider ──── s3iam or pgxiam
+            ycauth.Cache ──── TokenProvider ──── s3iam
 ```
 
 `TokenSource` obtains a fresh token. `Cache` turns it into a concurrent-safe
-`TokenProvider` suitable for a request or connection hot path. `s3iam` and
-`pgxiam` consume that provider; they do not store a long-lived IAM token.
+`TokenProvider` suitable for a request hot path. `s3iam` consumes that provider;
+it does not store a long-lived IAM token.
 
 Outbound requests send `User-Agent: ycauth` by default. Override it with
 `imds.WithUserAgent`, `authzkey.WithUserAgent`, or
@@ -145,9 +141,9 @@ if errors.Is(err, ycauth.ErrBackoff) {
 ```
 
 Call `tokens.Invalidate()` only when the IAM token itself is known to be
-invalid. For example, after a new PostgreSQL connection fails because its IAM
-credential is stale, invalidate and retry opening the connection. A wrong
-database user, role, or endpoint will not be fixed by minting another token.
+invalid. For example, when an upstream service explicitly rejects it as expired
+or revoked, invalidate it before retrying. A permissions or endpoint error will
+not be fixed by minting another token.
 
 `*ycauth.APIError` includes an HTTP status code, request ID, bounded response
 body excerpt, and any `Retry-After` hint. The hint is honoured as sent but
@@ -235,83 +231,14 @@ Those errors use HTTP 400. Invalid access keys, security data, or request
 signatures can use HTTP 403. See Yandex Cloud's [Object Storage response-code
 reference](https://yandex.cloud/en/docs/storage/s3/api-ref/response-codes).
 
-## PostgreSQL with pgxpool
-
-The IAM token travels as the connection password, so the DSN must establish TLS:
-use `sslmode=verify-full` with the Yandex Cloud CA. pgx's default of
-`sslmode=prefer` falls back to an unencrypted connection, and `pgxiam` cannot
-detect that fallback - it configures connections, it does not negotiate them.
-
-Configure IAM authentication before opening the pool:
-
-```go
-poolConfig, err := pgxpool.ParseConfig(databaseURL)
-if err != nil {
-	return err
-}
-
-if authMode == "iam" {
-	pgxiam.ConfigurePool(poolConfig, tokens)
-}
-
-pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
-if err != nil {
-	return err
-}
-defer pool.Close()
-
-if err := pool.Ping(ctx); err != nil {
-	return err
-}
-```
-
-`ConfigurePool` preserves any existing `BeforeConnect` hook and runs it first.
-It injects the IAM token into pgx's connection-local config copy immediately
-before each physical connection, so the base pool config does not retain it.
-Do not keep a static password in an IAM-auth DSN: IAM injection runs last and
-replaces it.
-
-Existing authenticated connections do not need to be closed merely because the
-IAM token later expires. The token is required when a new physical connection
-is created, not for every query.
-
-## PostgreSQL with database/sql
-
-Use pgx's stdlib connector rather than `sql.Open("pgx", dsn)`, which has a
-static DSN and cannot rotate an IAM token:
-
-```go
-connectionConfig, err := pgx.ParseConfig(databaseURL)
-if err != nil {
-	return err
-}
-
-db := stdlib.OpenDB(*connectionConfig, pgxiam.StdlibOption(tokens))
-defer db.Close()
-
-db.SetMaxOpenConns(20)
-db.SetMaxIdleConns(10)
-db.SetConnMaxLifetime(time.Hour)
-
-if err := db.PingContext(ctx); err != nil {
-	return err
-}
-```
-
-The PostgreSQL user, cluster access bindings, and endpoint or Connection
-Manager must already be configured for IAM authentication. This library does
-not create cloud resources or discover database endpoints. See the Yandex Cloud
-[PostgreSQL IAM connection guide](https://yandex.cloud/en/docs/managed-postgresql/operations/connect/clients).
-
 ## Security and operations
 
 - Treat IAM tokens, private keys, access keys, secret keys, and session tokens
   as secrets. `Token` redacts its value from JSON, `%s`, `%#v`, and `slog`, but
   direct access to `Token.Value` is still sensitive.
 - HTTP responses, key files, and policy documents are validated. A nil token
-  source or provider is rejected where it is supplied: constructors return an
-  error, and the `pgxiam` hook builders panic. A nil context is a programmer
-  error.
+  source or provider is rejected where it is supplied. A nil context is a
+  programmer error.
 - Prefer `imds` on Compute Cloud. It avoids distributing a service-account
   private key to the workload.
 - Keep one `Cache` and one AWS credentials cache per identity/configuration;
@@ -328,8 +255,8 @@ go vet ./...
 golangci-lint run ./...
 ```
 
-When a root-module API changes for `s3iam` or `pgxiam`, add a local,
-uncommitted `replace github.com/skarm/ycauth => ..` directive in that submodule.
+When a root-module API changes for `s3iam`, add a local, uncommitted
+`replace github.com/skarm/ycauth => ..` directive in that submodule.
 Release the root module first, update the submodule requirement to the released
 version, then run `go mod tidy -diff`, `go build ./...`, `go vet ./...`, and
 `go test -race ./...` with `GOWORK=off` and no replace directive before tagging

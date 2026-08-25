@@ -4,16 +4,13 @@
 
 `ycauth` — набор небольших Go-модулей для приложений с короткоживущими
 IAM-токенами Yandex Cloud. В него входят источники токенов, потокобезопасный
-кэш, временные учётные данные для Object Storage через AWS SDK v2 и
-IAM-аутентификация новых соединений pgx v5.
+кэш и временные учётные данные для Object Storage через AWS SDK v2.
 
 Подключайте только нужные модули:
 
 - `github.com/skarm/ycauth` — источники IAM-токенов и `Cache`;
 - `github.com/skarm/ycauth/s3iam` — временные учётные данные Object Storage для
   AWS SDK for Go v2;
-- `github.com/skarm/ycauth/pgxiam` — IAM-аутентификация новых физических
-  соединений pgx.
 
 Для всех модулей нужен Go 1.25 или новее. Добавьте опубликованную версию
 нужного модуля в `go.mod`:
@@ -21,7 +18,6 @@ IAM-аутентификация новых соединений pgx v5.
 ```bash
 go get github.com/skarm/ycauth@<version>
 go get github.com/skarm/ycauth/s3iam@<version> # только Object Storage
-go get github.com/skarm/ycauth/pgxiam@<version> # только PostgreSQL
 ```
 
 ## Архитектура
@@ -30,13 +26,12 @@ go get github.com/skarm/ycauth/pgxiam@<version> # только PostgreSQL
 imds.Source или authzkey.Source
                 │
                 ▼
-            ycauth.Cache ──── TokenProvider ──── s3iam или pgxiam
+            ycauth.Cache ──── TokenProvider ──── s3iam
 ```
 
 `TokenSource` получает свежий токен. `Cache` превращает его в потокобезопасный
-`TokenProvider` для горячего пути запроса или создания соединения. `s3iam` и
-`pgxiam` используют этот поставщик токенов, но сами не хранят долгоживущий
-IAM-токен.
+`TokenProvider` для горячего пути запроса. `s3iam` использует этот поставщик
+токенов, но сам не хранит долгоживущий IAM-токен.
 
 Исходящие запросы по умолчанию содержат `User-Agent: ycauth`. Если приложению
 нужно представиться, задайте свой заголовок через `imds.WithUserAgent`,
@@ -153,9 +148,9 @@ if errors.Is(err, ycauth.ErrBackoff) {
 ```
 
 Вызывайте `tokens.Invalidate()` только когда невалиден сам IAM-токен. Например,
-если новое PostgreSQL-соединение не прошло из-за устаревших IAM-учётных данных,
-инвалидируйте кэш и повторите создание соединения. Неверного пользователя БД,
-роли или адреса службы новый токен не исправит.
+если внешняя служба явно отклонила его как истёкший или отозванный,
+инвалидируйте кэш перед повторной попыткой. Ошибку прав доступа или адреса
+службы новый токен не исправит.
 
 `*ycauth.APIError` содержит статус HTTP, идентификатор запроса, ограниченный
 фрагмент тела ответа и `Retry-After`. Подсказка `Retry-After` соблюдается как
@@ -244,74 +239,6 @@ credentials.Invalidate()
 или подпись могут дать HTTP 403. См. официальный [список кодов ответа Object
 Storage](https://yandex.cloud/ru/docs/storage/s3/api-ref/response-codes).
 
-## PostgreSQL с pgxpool
-
-IAM-токен передаётся как пароль подключения, поэтому DSN обязан устанавливать
-TLS: используйте `sslmode=verify-full` с CA Yandex Cloud. Значение по умолчанию
-в pgx — `sslmode=prefer` — молча откатывается на незашифрованное соединение, и
-`pgxiam` этого не увидит: он настраивает подключения, а не согласовывает их.
-
-Настройте IAM-аутентификацию до открытия пула:
-
-```go
-poolConfig, err := pgxpool.ParseConfig(databaseURL)
-if err != nil {
-	return err
-}
-
-if authMode == "iam" {
-	pgxiam.ConfigurePool(poolConfig, tokens)
-}
-
-pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
-if err != nil {
-	return err
-}
-defer pool.Close()
-
-if err := pool.Ping(ctx); err != nil {
-	return err
-}
-```
-
-`ConfigurePool` сохраняет `BeforeConnect` и запускает его первым. Перед каждым
-физическим соединением IAM-токен записывается в локальную для соединения копию
-конфигурации pgx, поэтому базовая конфигурация пула не хранит токен. Не храните
-постоянный пароль в IAM DSN: IAM-учётные данные записываются последними и
-заменяют его.
-
-Уже аутентифицированные соединения не нужно закрывать из-за истечения
-IAM-токена. Он нужен при создании нового физического соединения, а не для
-каждого SQL-запроса.
-
-## PostgreSQL с database/sql
-
-Используйте стандартный коннектор pgx вместо `sql.Open("pgx", dsn)`: у него
-статичный DSN и он не умеет менять IAM-токен.
-
-```go
-connectionConfig, err := pgx.ParseConfig(databaseURL)
-if err != nil {
-	return err
-}
-
-db := stdlib.OpenDB(*connectionConfig, pgxiam.StdlibOption(tokens))
-defer db.Close()
-
-db.SetMaxOpenConns(20)
-db.SetMaxIdleConns(10)
-db.SetConnMaxLifetime(time.Hour)
-
-if err := db.PingContext(ctx); err != nil {
-	return err
-}
-```
-
-Пользователь PostgreSQL, привязки прав доступа к кластеру и адрес либо
-Connection Manager должны быть заранее настроены для IAM-аутентификации.
-Библиотека не создаёт облачные ресурсы и не ищет адреса базы данных. См. руководство Yandex
-Cloud по [подключению к PostgreSQL через IAM](https://yandex.cloud/ru/docs/managed-postgresql/operations/connect/clients).
-
 ## Безопасность и эксплуатация
 
 - IAM-токены, закрытые ключи, ключи доступа, секретные ключи и сеансовые токены
@@ -319,8 +246,8 @@ Cloud по [подключению к PostgreSQL через IAM](https://yandex.
   но прямое чтение `Token.Value` остаётся чувствительным.
 - HTTP-ответы, файлы ключей и документы политик валидируются. Отсутствующий
   (`nil`) `TokenProvider` или `TokenSource` отклоняется там, где он передаётся:
-  конструкторы возвращают ошибку, а построители хуков `pgxiam` вызывают панику.
-  Значение `nil` для `context.Context` остаётся ошибкой в коде приложения.
+  конструкторы возвращают ошибку. Значение `nil` для `context.Context` остаётся
+  ошибкой в коде приложения.
 - В Compute Cloud предпочитайте `imds`: тогда закрытый ключ сервисного
   аккаунта не нужно распространять в приложение.
 - Используйте один `Cache` и один кэш учётных данных AWS на учётную запись и
@@ -337,8 +264,8 @@ go vet ./...
 golangci-lint run ./...
 ```
 
-При изменении API корневого модуля для `s3iam` или `pgxiam` добавляйте в
-подмодуль локальную некоммитимую директиву `replace github.com/skarm/ycauth => ..`.
+При изменении API корневого модуля для `s3iam` добавляйте в подмодуль локальную
+некоммитимую директиву `replace github.com/skarm/ycauth => ..`.
 Сначала выпустите корневой модуль, обновите зависимость подмодуля на опубликованную версию, затем
 запустите `go mod tidy -diff`, `go build ./...`, `go vet ./...` и
 `go test -race ./...` с `GOWORK=off` и без директивы replace перед тегированием

@@ -19,16 +19,6 @@ updates:
       go-dependencies:
         patterns: ["*"]
 
-  - package-ecosystem: gomod
-    directory: /pgxiam
-    schedule:
-      interval: weekly
-    ignore:
-      - dependency-name: github.com/skarm/ycauth
-    groups:
-      go-dependencies:
-        patterns: ["*"]
-
   - package-ecosystem: github-actions
     directory: /
     schedule:
