@@ -19,6 +19,17 @@ updates:
       go-dependencies:
         patterns: ["*"]
 
+  - package-ecosystem: gomod
+    directory: /pgxiam
+    schedule:
+      interval: weekly
+    ignore:
+      # Released in lockstep with the root module, not by Dependabot.
+      - dependency-name: github.com/skarm/ycauth
+    groups:
+      go-dependencies:
+        patterns: ["*"]
+
   - package-ecosystem: github-actions
     directory: /
     schedule:

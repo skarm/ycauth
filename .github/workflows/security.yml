@@ -19,7 +19,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        module: [".", "s3iam"]
+        module: [".", "s3iam", "pgxiam"]
     defaults:
       run:
         working-directory: ${{ matrix.module }}

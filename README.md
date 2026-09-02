@@ -4,13 +4,16 @@
 
 `ycauth` provides small Go modules for applications that use short-lived Yandex
 Cloud IAM tokens. It includes token sources, a concurrency-safe cache,
-and ephemeral Object Storage credentials for AWS SDK v2.
+ephemeral Object Storage credentials for AWS SDK v2, and IAM authentication for
+new pgx v5 connections.
 
 Use only the modules your application needs:
 
 - `github.com/skarm/ycauth` — token sources and `Cache`.
 - `github.com/skarm/ycauth/s3iam` — temporary Object Storage credentials for
   AWS SDK for Go v2.
+- `github.com/skarm/ycauth/pgxiam` — IAM authentication for new pgx physical
+  connections.
 
 All modules require Go 1.25 or later. Add a released version of each required
 module to `go.mod`:
@@ -18,6 +21,7 @@ module to `go.mod`:
 ```bash
 go get github.com/skarm/ycauth@<version>
 go get github.com/skarm/ycauth/s3iam@<version> # Object Storage only
+go get github.com/skarm/ycauth/pgxiam@<version> # PostgreSQL only
 ```
 
 ## Architecture
@@ -26,12 +30,12 @@ go get github.com/skarm/ycauth/s3iam@<version> # Object Storage only
 imds.Source or authzkey.Source
                 │
                 ▼
-            ycauth.Cache ──── TokenProvider ──── s3iam
+            ycauth.Cache ──── TokenProvider ──── s3iam or pgxiam
 ```
 
 `TokenSource` obtains a fresh token. `Cache` turns it into a concurrent-safe
-`TokenProvider` suitable for a request hot path. `s3iam` consumes that provider;
-it does not store a long-lived IAM token.
+`TokenProvider` suitable for a request or connection hot path. `s3iam` and
+`pgxiam` consume that provider; they do not store a long-lived IAM token.
 
 Outbound requests send `User-Agent: ycauth` by default. Override it with
 `imds.WithUserAgent`, `authzkey.WithUserAgent`, or
@@ -141,9 +145,9 @@ if errors.Is(err, ycauth.ErrBackoff) {
 ```
 
 Call `tokens.Invalidate()` only when the IAM token itself is known to be
-invalid. For example, when an upstream service explicitly rejects it as expired
-or revoked, invalidate it before retrying. A permissions or endpoint error will
-not be fixed by minting another token.
+invalid. For example, after a new PostgreSQL connection fails because its IAM
+credential is stale, invalidate and retry opening the connection. A wrong
+database user, role, or endpoint will not be fixed by minting another token.
 
 `*ycauth.APIError` includes an HTTP status code, request ID, bounded response
 body excerpt, and any `Retry-After` hint. The hint is honoured as sent but
@@ -231,14 +235,142 @@ Those errors use HTTP 400. Invalid access keys, security data, or request
 signatures can use HTTP 403. See Yandex Cloud's [Object Storage response-code
 reference](https://yandex.cloud/en/docs/storage/s3/api-ref/response-codes).
 
+## Preparing a service account for PostgreSQL
+
+Configure the service account and cluster before using `pgxiam`:
+
+- Use the service account ID, such as `aje...`, as the PostgreSQL username. A
+  service account name such as `my-service-account` is not a valid DSN username
+  for this authentication flow.
+- The IAM token must belong to the same service account whose ID is used as the
+  username. Supply a `TokenProvider` that obtains it from the runtime context or
+  metadata. On a Compute Cloud VM, use `imds`; where metadata is unavailable,
+  use an authorized key with `authzkey`.
+- Grant the connecting service account `iam.serviceAccounts.user` on that same
+  service account as a resource, or on its containing folder. Odyssey needs the
+  permission to read the account information. A broader role such as the
+  primitive `auditor` role also works, but prefer `iam.serviceAccounts.user` for
+  least privilege.
+- Separately grant the service account the
+  `managed-postgresql.clusters.connector` role on the target cluster. Create a
+  database user whose name is the service account ID, whose authentication
+  method is IAM, and which has access to the required database. `pgxiam` does
+  not create these resources.
+
+Grant the minimum role directly on the service account:
+
+```bash
+yc iam service-account add-access-binding <service-account-id> \
+  --role iam.serviceAccounts.user \
+  --subject serviceAccount:<service-account-id>
+```
+
+Alternatively, grant it on the folder from which the service account inherits
+permissions:
+
+```bash
+yc resource-manager folder add-access-binding <folder-id> \
+  --role iam.serviceAccounts.user \
+  --subject serviceAccount:<service-account-id>
+```
+
+Configure cluster access and the database user with:
+
+```bash
+yc managed-postgresql cluster add-access-binding \
+  --id <cluster-id> \
+  --role managed-postgresql.clusters.connector \
+  --service-account-id <service-account-id>
+
+yc managed-postgresql user create <service-account-id> \
+  --cluster-id <cluster-id> \
+  --auth-method auth-method-iam \
+  --permissions <database-name>
+```
+
+Verify that the ID in the DSN, the subject of these bindings, and the owner of
+the IAM token are the same service account. See the Yandex Cloud documentation
+for [service account access bindings](https://yandex.cloud/en/docs/iam/operations/sa/set-access-bindings),
+[assigning roles](https://yandex.cloud/en/docs/iam/operations/roles/grant), and
+[connecting to PostgreSQL with IAM](https://yandex.cloud/en/docs/managed-postgresql/operations/connect/clients).
+
+## PostgreSQL with pgxpool
+
+The IAM token travels as the connection password. The DSN username must be the
+service account ID, such as `aje...`, not the service account name. The DSN must
+also establish TLS: use `sslmode=verify-full` with the Yandex Cloud CA. pgx's
+default of `sslmode=prefer` falls back to an unencrypted connection, and
+`pgxiam` cannot detect that fallback—it configures connections, it does not
+negotiate them.
+
+Configure IAM authentication before opening the pool:
+
+```go
+poolConfig, err := pgxpool.ParseConfig(databaseURL)
+if err != nil {
+	return err
+}
+
+if authMode == "iam" {
+	pgxiam.ConfigurePool(poolConfig, tokens)
+}
+
+pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
+if err != nil {
+	return err
+}
+defer pool.Close()
+
+if err := pool.Ping(ctx); err != nil {
+	return err
+}
+```
+
+`ConfigurePool` preserves any existing `BeforeConnect` hook and runs it first.
+It injects the IAM token into pgx's connection-local config copy immediately
+before each physical connection, so the base pool config does not retain it.
+Do not keep a static password in an IAM-auth DSN: IAM injection runs last and
+replaces it.
+
+Existing authenticated connections do not need to be closed merely because the
+IAM token later expires. The token is required when a new physical connection
+is created, not for every query.
+
+## PostgreSQL with database/sql
+
+Use pgx's stdlib connector rather than `sql.Open("pgx", dsn)`, which has a
+static DSN and cannot rotate an IAM token:
+
+```go
+connectionConfig, err := pgx.ParseConfig(databaseURL)
+if err != nil {
+	return err
+}
+
+db := stdlib.OpenDB(*connectionConfig, pgxiam.StdlibOption(tokens))
+defer db.Close()
+
+db.SetMaxOpenConns(20)
+db.SetMaxIdleConns(10)
+db.SetConnMaxLifetime(time.Hour)
+
+if err := db.PingContext(ctx); err != nil {
+	return err
+}
+```
+
+The endpoint must be configured for IAM authentication. This library does not
+create cloud resources or discover database endpoints.
+
 ## Security and operations
 
 - Treat IAM tokens, private keys, access keys, secret keys, and session tokens
   as secrets. `Token` redacts its value from JSON, `%s`, `%#v`, and `slog`, but
   direct access to `Token.Value` is still sensitive.
 - HTTP responses, key files, and policy documents are validated. A nil token
-  source or provider is rejected where it is supplied. A nil context is a
-  programmer error.
+  source or provider is rejected where it is supplied: constructors return an
+  error, and the `pgxiam` hook builders panic. A nil context is a programmer
+  error.
 - Prefer `imds` on Compute Cloud. It avoids distributing a service-account
   private key to the workload.
 - Keep one `Cache` and one AWS credentials cache per identity/configuration;
@@ -255,7 +387,7 @@ go vet ./...
 golangci-lint run ./...
 ```
 
-When a root-module API changes for `s3iam`, add a local, uncommitted
+When a root-module API changes for `s3iam` or `pgxiam`, add a local, uncommitted
 `replace github.com/skarm/ycauth => ..` directive in that submodule.
 Release the root module first, update the submodule requirement to the released
 version, then run `go mod tidy -diff`, `go build ./...`, `go vet ./...`, and
