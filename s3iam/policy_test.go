@@ -2,10 +2,118 @@ package s3iam //nolint:testpackage // White-box assertions verify the generated 
 
 import (
 	"encoding/json"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
+
+func TestPrefixPoliciesKeepsGrantsIndependent(t *testing.T) {
+	t.Parallel()
+
+	policy, err := PrefixPolicies(
+		PrefixGrant{Bucket: "source-bucket", Prefix: "incoming", Permissions: PermissionReadObject | PermissionListObjects},
+		PrefixGrant{Bucket: "target-bucket", Prefix: "processed", Permissions: PermissionWriteObject | PermissionListObjects},
+		PrefixGrant{Bucket: "source-bucket", Prefix: "archive", Permissions: PermissionDeleteObject | PermissionListObjects},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got policyDocument
+	if err := json.Unmarshal([]byte(policy.JSON()), &got); err != nil {
+		t.Fatal(err)
+	}
+	want := policyDocument{Version: "2012-10-17", Statement: []policyStatement{
+		{Effect: "Allow", Principal: "*", Action: []string{"s3:ListBucket"}, Resource: []string{"arn:aws:s3:::source-bucket"},
+			Condition: map[string]map[string][]string{"StringLike": {"s3:prefix": {"incoming", "incoming/*"}}}},
+		{Effect: "Allow", Principal: "*", Action: []string{"s3:GetObject"}, Resource: []string{"arn:aws:s3:::source-bucket/incoming/*"}},
+		{Effect: "Allow", Principal: "*", Action: []string{"s3:ListBucket"}, Resource: []string{"arn:aws:s3:::target-bucket"},
+			Condition: map[string]map[string][]string{"StringLike": {"s3:prefix": {"processed", "processed/*"}}}},
+		{Effect: "Allow", Principal: "*", Action: []string{"s3:PutObject"}, Resource: []string{"arn:aws:s3:::target-bucket/processed/*"}},
+		{Effect: "Allow", Principal: "*", Action: []string{"s3:ListBucket"}, Resource: []string{"arn:aws:s3:::source-bucket"},
+			Condition: map[string]map[string][]string{"StringLike": {"s3:prefix": {"archive", "archive/*"}}}},
+		{Effect: "Allow", Principal: "*", Action: []string{"s3:DeleteObject"}, Resource: []string{"arn:aws:s3:::source-bucket/archive/*"}},
+	}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("policy = %s, want %#v", policy.JSON(), want)
+	}
+}
+
+func TestPrefixPoliciesWholeBucket(t *testing.T) {
+	t.Parallel()
+
+	policy, err := PrefixPolicies(PrefixGrant{Bucket: "bucket", Permissions: PermissionReadObject | PermissionListObjects})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got policyDocument
+	if err := json.Unmarshal([]byte(policy.JSON()), &got); err != nil {
+		t.Fatal(err)
+	}
+	want := policyDocument{Version: "2012-10-17", Statement: []policyStatement{
+		{Effect: "Allow", Principal: "*", Action: []string{"s3:ListBucket"}, Resource: []string{"arn:aws:s3:::bucket"}},
+		{Effect: "Allow", Principal: "*", Action: []string{"s3:GetObject"}, Resource: []string{"arn:aws:s3:::bucket/*"}},
+	}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("policy = %s, want %#v", policy.JSON(), want)
+	}
+}
+
+func TestPrefixPoliciesRejectsInvalidGrants(t *testing.T) {
+	t.Parallel()
+
+	if policy, err := PrefixPolicies(); err == nil || policy.JSON() != "" {
+		t.Fatalf("empty grants: policy = %q, error = %v", policy.JSON(), err)
+	}
+	valid := PrefixGrant{Bucket: "bucket", Prefix: "tenant", Permissions: PermissionReadObject}
+	for _, invalid := range []PrefixGrant{
+		{},
+		{Bucket: "bad bucket", Permissions: PermissionReadObject},
+		{Bucket: "bucket", Prefix: "bad/*", Permissions: PermissionReadObject},
+		{Bucket: "bucket", Prefix: "/tenant", Permissions: PermissionReadObject},
+		{Bucket: "bucket", Prefix: "tenant/", Permissions: PermissionReadObject},
+		{Bucket: "bucket", Prefix: "invalid\xff", Permissions: PermissionReadObject},
+		{Bucket: "bucket", Permissions: 0},
+		{Bucket: "bucket", Permissions: 1 << 30},
+	} {
+		policy, err := PrefixPolicies(valid, invalid)
+		if err == nil || policy.JSON() != "" {
+			t.Fatalf("grant %#v: policy = %q, error = %v", invalid, policy.JSON(), err)
+		}
+		if !strings.Contains(err.Error(), "grant 2:") {
+			t.Fatalf("error does not identify invalid grant: %v", err)
+		}
+	}
+}
+
+func TestPrefixPoliciesCombinedCharacterLimit(t *testing.T) {
+	t.Parallel()
+
+	first := PrefixGrant{Bucket: "source-bucket", Prefix: "я", Permissions: PermissionReadObject}
+	second := PrefixGrant{Bucket: "target-bucket", Prefix: "output", Permissions: PermissionWriteObject}
+	base, err := PrefixPolicies(first, second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.Prefix += strings.Repeat("я", maxPolicyLength-utf8.RuneCountInString(base.JSON()))
+	policy, err := PrefixPolicies(first, second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count := utf8.RuneCountInString(policy.JSON()); count != maxPolicyLength {
+		t.Fatalf("policy length = %d, want %d", count, maxPolicyLength)
+	}
+	first.Prefix += "я"
+	for _, grant := range []PrefixGrant{first, second} {
+		if _, err := PrefixPolicy(grant.Bucket, grant.Prefix, grant.Permissions); err != nil {
+			t.Fatalf("individual grant must fit: %v", err)
+		}
+	}
+	if policy, err := PrefixPolicies(first, second); err == nil || policy.JSON() != "" {
+		t.Fatalf("oversized combined policy = %q, error = %v", policy.JSON(), err)
+	}
+}
 
 func TestPrefixPolicy(t *testing.T) {
 	t.Parallel()

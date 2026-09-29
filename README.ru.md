@@ -231,6 +231,39 @@ IAM-токена; значение по умолчанию — десять се
 произвольной политики. Компактный документ должен укладываться в лимит Yandex
 Cloud в 2048 символов.
 
+Для нескольких бакетов или префиксов одного бакета используйте `PrefixPolicies`:
+
+```go
+policy, err := s3iam.PrefixPolicies(
+	s3iam.PrefixGrant{
+		Bucket:      "source-bucket",
+		Prefix:      "incoming",
+		Permissions: s3iam.PermissionReadObject | s3iam.PermissionListObjects,
+	},
+	s3iam.PrefixGrant{
+		Bucket:      "target-bucket",
+		Prefix:      "processed",
+		Permissions: s3iam.PermissionWriteObject,
+	},
+)
+if err != nil {
+	log.Fatal(err)
+}
+credentials, err := s3iam.New(tokens, s3iam.Config{
+	SessionName:   "copy-objects",
+	SessionPolicy: policy,
+})
+if err != nil {
+	log.Fatal(err)
+}
+```
+
+Один провайдер учётных данных можно использовать для всех перечисленных бакетов.
+Каждый `PrefixGrant` сохраняет собственные права и условия листинга. Права
+складываются: более узкое правило не ограничивает более широкое. Пустой список
+правил и любое невалидное правило вызывают ошибку; лимит 2048 символов применяется
+ко всему документу. `PrefixPolicy` остаётся сокращённой формой для одного правила.
+
 ### Обновление отклонённых S3-учётных данных
 
 При `ExpiredToken`, `InvalidToken` или `TokenRefreshRequired` от Object Storage

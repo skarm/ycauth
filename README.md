@@ -221,6 +221,39 @@ syntax and compacts the document, but cannot prove that an arbitrary policy is
 safe. The compact document must fit Yandex Cloud's 2048-character inline-policy
 limit.
 
+For multiple buckets or multiple prefixes in one bucket, use `PrefixPolicies`:
+
+```go
+policy, err := s3iam.PrefixPolicies(
+	s3iam.PrefixGrant{
+		Bucket:      "source-bucket",
+		Prefix:      "incoming",
+		Permissions: s3iam.PermissionReadObject | s3iam.PermissionListObjects,
+	},
+	s3iam.PrefixGrant{
+		Bucket:      "target-bucket",
+		Prefix:      "processed",
+		Permissions: s3iam.PermissionWriteObject,
+	},
+)
+if err != nil {
+	log.Fatal(err)
+}
+credentials, err := s3iam.New(tokens, s3iam.Config{
+	SessionName:   "copy-objects",
+	SessionPolicy: policy,
+})
+if err != nil {
+	log.Fatal(err)
+}
+```
+
+One credentials provider can serve all listed buckets. Each `PrefixGrant` keeps
+its own permissions and listing conditions. Permissions are additive: a narrower
+grant does not restrict a broader one. An empty grant list or any invalid grant
+returns an error; the 2048-character limit applies to the entire document.
+`PrefixPolicy` remains the shorthand for a single grant.
+
 ### Refresh rejected S3 credentials
 
 When Object Storage returns `ExpiredToken`, `InvalidToken`, or

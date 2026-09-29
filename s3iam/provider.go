@@ -64,8 +64,9 @@ type Config struct {
 	// from [MinDuration] through [MaxDuration]. Zero uses one hour.
 	Duration time.Duration
 	// SessionPolicy optionally restricts the credentials. Construct it with
-	// [PrefixPolicy] or [RawPolicy]. Its zero value omits the policy, allowing all
-	// Object Storage permissions already granted to the subject.
+	// [PrefixPolicy], [PrefixPolicies], or [RawPolicy]. One policy can cover
+	// multiple buckets. Its zero value omits the policy, allowing all Object
+	// Storage permissions already granted to the subject.
 	SessionPolicy SessionPolicy
 	// Endpoint overrides DefaultEndpoint. It must use HTTPS unless it is a
 	// loopback endpoint for a local emulator.

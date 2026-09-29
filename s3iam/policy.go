@@ -13,13 +13,16 @@ import (
 )
 
 const (
-	maxPolicyLength = 2048
-	minBucketLength = 3
-	maxBucketLength = 63
+	// policyLanguageVersion identifies the AWS IAM policy language supported by
+	// Yandex Object Storage. It is not the policy's creation or modification date.
+	policyLanguageVersion = "2012-10-17"
+	maxPolicyLength       = 2048
+	minBucketLength       = 3
+	maxBucketLength       = 63
 )
 
-// Permissions is a bit set of permissions accepted by [PrefixPolicy]. Combine
-// permissions with the bitwise OR operator.
+// Permissions is a bit set of permissions accepted by [PrefixPolicy] and
+// [PrefixPolicies]. Combine permissions with the bitwise OR operator.
 type Permissions uint32
 
 const (
@@ -44,7 +47,8 @@ const (
 const allPermissions = PermissionReadObject | PermissionListObjects | PermissionWriteObject | PermissionDeleteObject | PermissionMultipartUpload | PermissionBucketLocation
 
 // SessionPolicy is a validated, compact inline policy for ephemeral
-// credentials. Construct a SessionPolicy with [PrefixPolicy] or [RawPolicy].
+// credentials. Construct a SessionPolicy with [PrefixPolicy], [PrefixPolicies],
+// or [RawPolicy].
 // Its zero value tells [New] to omit the policy and use all Object Storage
 // permissions already granted to the subject.
 type SessionPolicy struct {
@@ -78,24 +82,71 @@ func RawPolicy(data []byte) (SessionPolicy, error) {
 // An empty prefix deliberately covers the whole bucket, so pass one only when
 // that is intended: an unset variable widens the policy rather than failing.
 func PrefixPolicy(bucket, prefix string, permissions Permissions) (SessionPolicy, error) {
+	return PrefixPolicies(PrefixGrant{Bucket: bucket, Prefix: prefix, Permissions: permissions})
+}
+
+// PrefixGrant grants permissions for one bucket and object prefix.
+type PrefixGrant struct {
+	// Bucket is a DNS-style Object Storage bucket name.
+	Bucket string
+	// Prefix is a literal object prefix with the same restrictions as [PrefixPolicy].
+	// An empty prefix deliberately covers the whole bucket.
+	Prefix string
+	// Permissions must contain at least one supported permission.
+	Permissions Permissions
+}
+
+// PrefixPolicies builds one session policy from one or more grants. Grants may
+// refer to different buckets or different prefixes in the same bucket. Their
+// permissions are additive; a narrower grant does not restrict a broader one.
+// Each grant preserves its own resources and listing conditions.
+//
+// An empty grant list or any invalid grant returns an error. The complete compact
+// policy must fit the 2,048-character limit. Pass the result to [Config.SessionPolicy].
+func PrefixPolicies(grants ...PrefixGrant) (SessionPolicy, error) {
+	if len(grants) == 0 {
+		return SessionPolicy{}, errors.New("create S3 prefix policies: at least one grant is required")
+	}
+
+	var statements []policyStatement
+
+	for index, grant := range grants {
+		grantStatements, err := prefixStatements(grant.Bucket, grant.Prefix, grant.Permissions)
+		if err != nil {
+			return SessionPolicy{}, fmt.Errorf("create S3 prefix policies: grant %d: %w", index+1, err)
+		}
+
+		statements = append(statements, grantStatements...)
+	}
+
+	data, err := json.Marshal(policyDocument{Version: policyLanguageVersion, Statement: statements})
+	if err != nil {
+		return SessionPolicy{}, fmt.Errorf("create S3 prefix policy: encode JSON: %w", err)
+	}
+
+	return sessionPolicyFromJSON(data)
+}
+
+// prefixStatements validates a grant and builds its independent statements.
+func prefixStatements(bucket, prefix string, permissions Permissions) ([]policyStatement, error) {
 	if !validBucket(bucket) {
-		return SessionPolicy{}, errors.New("create S3 prefix policy: invalid bucket " + strconv.Quote(bucket))
+		return nil, errors.New("create S3 prefix policy: invalid bucket " + strconv.Quote(bucket))
 	}
 
 	if permissions == 0 {
-		return SessionPolicy{}, errors.New("create S3 prefix policy: at least one permission is required")
+		return nil, errors.New("create S3 prefix policy: at least one permission is required")
 	}
 
 	if unknown := permissions &^ allPermissions; unknown != 0 {
-		return SessionPolicy{}, errors.New("create S3 prefix policy: unsupported permission bits 0x" + strconv.FormatUint(uint64(unknown), 16))
+		return nil, errors.New("create S3 prefix policy: unsupported permission bits 0x" + strconv.FormatUint(uint64(unknown), 16))
 	}
 
 	if strings.HasPrefix(prefix, "/") || strings.HasSuffix(prefix, "/") {
-		return SessionPolicy{}, errors.New("create S3 prefix policy: prefix must not begin or end with a slash")
+		return nil, errors.New("create S3 prefix policy: prefix must not begin or end with a slash")
 	}
 
 	if !validPrefix(prefix) {
-		return SessionPolicy{}, errors.New("create S3 prefix policy: invalid prefix " + strconv.Quote(prefix))
+		return nil, errors.New("create S3 prefix policy: invalid prefix " + strconv.Quote(prefix))
 	}
 
 	bucketARN := "arn:aws:s3:::" + bucket
@@ -159,12 +210,7 @@ func PrefixPolicy(bucket, prefix string, permissions Permissions) (SessionPolicy
 		})
 	}
 
-	data, err := json.Marshal(policyDocument{Version: "2012-10-17", Statement: statements})
-	if err != nil {
-		return SessionPolicy{}, fmt.Errorf("create S3 prefix policy: encode JSON: %w", err)
-	}
-
-	return sessionPolicyFromJSON(data)
+	return statements, nil
 }
 
 // validBucket applies the Object Storage DNS-style naming rules and rejects IPv4
