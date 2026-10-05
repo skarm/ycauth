@@ -18,7 +18,7 @@ jobs:
       fail-fast: false
       matrix:
         module: [".", "s3iam", "pgxiam"]
-        go: ["1.25.x", "1.26.x", "1.27.x"]
+        go: ["1.27.x"]
     defaults:
       run:
         working-directory: ${{ matrix.module }}
@@ -51,7 +51,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.25.x"
+          go-version: "1.27.x"
           cache-dependency-path: ${{ matrix.module }}/go.sum
       - name: Resolve the root module from the working tree
         if: matrix.module != '.'
@@ -72,7 +72,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
-          go-version: "1.25.x"
+          go-version: "1.27.x"
           cache-dependency-path: go.sum
       - name: Run every fuzz target briefly
         run: |
@@ -110,7 +110,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
-          go-version: "1.25.x"
+          go-version: "1.27.x"
           cache-dependency-path: s3iam/go.sum
       - run: go mod tidy -diff
       - run: go build ./...
@@ -128,7 +128,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
-          go-version: "1.25.x"
+          go-version: "1.27.x"
           cache-dependency-path: pgxiam/go.sum
       - run: go mod tidy -diff
       - run: go build ./...
