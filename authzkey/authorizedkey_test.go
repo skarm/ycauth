@@ -218,7 +218,7 @@ func TestSourceAcquireAPIError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		requests.Add(1)
 		writer.Header().Set("Retry-After", "7")
-		writer.Header().Set("X-Request-Id", "request-id")
+		writer.Header().Set("X-Request-ID", "request-id")
 		http.Error(writer, "unavailable", http.StatusServiceUnavailable)
 	}))
 	defer server.Close()

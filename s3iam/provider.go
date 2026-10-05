@@ -354,11 +354,13 @@ func (p *credentialsIssuer) recordSuccess(credentials aws.Credentials) {
 // recordFailure advances refresh backoff while returning the live failure to
 // the current caller.
 func (p *credentialsIssuer) recordFailure(err error) error {
+	hint := retryAfterHint(err)
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	p.failures = min(p.failures+1, backoff.MaxFailures)
-	p.nextAttemptAt = p.now().Add(failureBackoff.Delay(p.failures, retryAfterHint(err), p.jitterSource))
+	p.nextAttemptAt = p.now().Add(failureBackoff.Delay(p.failures, hint, p.jitterSource))
 	p.lastErr = fmt.Errorf("create ephemeral S3 credentials: %w until %s: %w",
 		ycauth.ErrBackoff, p.nextAttemptAt.Format(time.RFC3339Nano), err)
 

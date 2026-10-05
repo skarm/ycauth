@@ -29,6 +29,36 @@ func (c *fakeClock) Advance(duration time.Duration) {
 	c.mu.Unlock()
 }
 
+func TestCacheTokenRejectsNilContext(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int64
+	cache, err := NewCache(TokenSourceFunc(func(context.Context) (Token, error) {
+		calls.Add(1)
+		return Token{Value: "token", ExpiresAt: time.Now().Add(time.Hour)}, nil
+	}), CacheConfig{})
+	if err != nil {
+		t.Fatalf("NewCache() error = %v", err)
+	}
+
+	for _, state := range []string{"empty", "warm"} {
+		if state == "warm" {
+			if _, err := cache.Token(context.Background()); err != nil {
+				t.Fatalf("warm cache: %v", err)
+			}
+		}
+
+		token, err := cache.Token(nil) //nolint:staticcheck // Exercise rejection of a nil context.
+		if err == nil || err.Error() != "get IAM token: context must not be nil" || token != (Token{}) {
+			t.Fatalf("%s cache Token(nil) = (%v, %v), want an empty token and nil-context error", state, token, err)
+		}
+	}
+
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("source calls = %d, want only the warm-up call", got)
+	}
+}
+
 func TestCacheCachesAndCoalesces(t *testing.T) {
 	t.Parallel()
 
@@ -477,16 +507,18 @@ func (brokenError) Unwrap() error { panic("Unwrap exploded") }
 func TestCacheContainsPanickingSourceError(t *testing.T) {
 	t.Parallel()
 
+	now := time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)
+	clock := &fakeClock{now: now}
 	var calls atomic.Int64
-	cache, err := NewCache(TokenSourceFunc(func(context.Context) (Token, error) {
+	cache, err := newCache(TokenSourceFunc(func(context.Context) (Token, error) {
 		if calls.Add(1) == 1 {
 			return Token{}, brokenError{}
 		}
 
-		return Token{Value: "recovered", ExpiresAt: time.Now().Add(time.Hour)}, nil
-	}), CacheConfig{Backoff: BackoffConfig{Initial: time.Nanosecond, Max: time.Nanosecond, Multiplier: 1}})
+		return Token{Value: "recovered", ExpiresAt: now.Add(time.Hour)}, nil
+	}), CacheConfig{Backoff: BackoffConfig{Initial: time.Second, Max: time.Second, Multiplier: 1}}, clock.Now, func() float64 { return 0.5 })
 	if err != nil {
-		t.Fatalf("NewCache() error = %v", err)
+		t.Fatalf("newCache() error = %v", err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -495,8 +527,15 @@ func TestCacheContainsPanickingSourceError(t *testing.T) {
 	if _, err := cache.Token(ctx); err == nil {
 		t.Fatal("Token() error = nil, want the contained panic")
 	}
+	cache.mu.Lock()
+	failures := cache.failures
+	cache.mu.Unlock()
+	if failures != 1 {
+		t.Fatalf("failures = %d, want 1", failures)
+	}
 
 	// The panic must not have kept the refresh slot or stranded later callers.
+	clock.Advance(time.Second)
 	token, err := cache.Token(ctx)
 	if err != nil || token.Value != "recovered" {
 		t.Fatalf("Token() after a panicking error = (%v, %v)", token, err)

@@ -4,6 +4,7 @@
 *.test
 coverage.out
 dist/
+local/
 
 # Workspaces hide missing version tags and make local builds diverge from
 # what consumers resolve. Keep them local.

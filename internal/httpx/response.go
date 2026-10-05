@@ -80,7 +80,7 @@ func errorBody(data []byte) string {
 // requestID returns the first bounded request identifier recognized by Yandex
 // Cloud APIs.
 func requestID(header http.Header) string {
-	for _, name := range []string{"X-Request-Id", "X-Server-Trace-Id", "X-Trace-Id"} {
+	for _, name := range []string{"X-Request-ID", "X-Server-Trace-ID", "X-Trace-ID"} {
 		if value := strings.TrimSpace(header.Get(name)); value != "" && len(value) <= maxRequestIDLen {
 			return value
 		}

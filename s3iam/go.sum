@@ -1,6 +1,6 @@
-github.com/aws/aws-sdk-go-v2 v1.43.7 h1:msCzvkeYJA9ehbV8mRRmkZLo/zJg/+yDVLNtflg83hQ=
-github.com/aws/aws-sdk-go-v2 v1.43.7/go.mod h1:tXpPM+v0D1lndmga+HqqLDIzUFJlEeR21aspVklHF00=
-github.com/aws/smithy-go v1.27.9 h1:flT/ACSU1ksz3V+8wj8kN8DOB9tsc/ggWPTJXIieRpw=
-github.com/aws/smithy-go v1.27.9/go.mod h1:YE2RhdIuDbA5E5bTdciG9KrW3+TiEONeUWCqxX9i1Fc=
-github.com/skarm/ycauth v0.1.0 h1:iGwklp8W4e3PgJUmxclQINrqY+hStm2GGt+XoBt50VQ=
-github.com/skarm/ycauth v0.1.0/go.mod h1:hkqRQu8QEhQTx8j0qu96FdjlTBIHMZ9MJ7Hdi3VNnd0=
+github.com/aws/aws-sdk-go-v2 v1.47.1 h1:uOIZnp4PK3ZhKI0dNrJrhTEsLxbpXHTAJlwoS1pvAtw=
+github.com/aws/aws-sdk-go-v2 v1.47.1/go.mod h1:bttEH6JqnUL8LepvDVfdrds/fZ5bCIxzpe3abyUrhDU=
+github.com/aws/smithy-go v1.28.2 h1:myhcykQcatTul2B/zITjDk203G7t0awUAs1hVry5Bvg=
+github.com/aws/smithy-go v1.28.2/go.mod h1:YE2RhdIuDbA5E5bTdciG9KrW3+TiEONeUWCqxX9i1Fc=
+github.com/skarm/ycauth v0.4.1 h1:OcKIS2TQuRFpvNKv4uRBsZRWUCePy4e1jdsEqwohaLo=
+github.com/skarm/ycauth v0.4.1/go.mod h1:hkqRQu8QEhQTx8j0qu96FdjlTBIHMZ9MJ7Hdi3VNnd0=

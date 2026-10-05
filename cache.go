@@ -201,8 +201,12 @@ func newCache(tokenSource TokenSource, config CacheConfig, now func() time.Time,
 
 // Token returns a cached token, or waits for the shared refresh when no valid
 // token is cached. Cancellation stops only this caller's wait; it never
-// cancels a refresh needed by others.
+// cancels a refresh needed by others. A nil context returns an error.
 func (c *Cache) Token(ctx context.Context) (Token, error) {
+	if ctx == nil {
+		return Token{}, errors.New("get IAM token: context must not be nil")
+	}
+
 	for {
 		current := c.current.Load()
 		now := c.now()
@@ -343,6 +347,7 @@ func (c *Cache) publish(call *refreshCall, startedAt time.Time, token Token, err
 	}
 
 	event := RefreshEvent{StartedAt: startedAt, FinishedAt: finishedAt, Err: err}
+	hint := retryAfterHint(err)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -358,7 +363,7 @@ func (c *Cache) publish(call *refreshCall, startedAt time.Time, token Token, err
 		event.ExpiresAt = token.ExpiresAt
 	} else {
 		c.failures = min(c.failures+1, backoff.MaxFailures)
-		c.nextAttemptAt = finishedAt.Add(c.backoff.Delay(c.failures, retryAfterHint(err), c.jitterSource))
+		c.nextAttemptAt = finishedAt.Add(c.backoff.Delay(c.failures, hint, c.jitterSource))
 		// Built once per backoff window rather than per suppressed call.
 		c.backoffErr = fmt.Errorf("get IAM token: %w until %s: %w", ErrBackoff, c.nextAttemptAt.Format(time.RFC3339Nano), err)
 		event.Failures = c.failures

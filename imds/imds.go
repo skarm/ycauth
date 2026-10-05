@@ -36,7 +36,14 @@ var defaultHTTPClient = &http.Client{
 	Transport: func() *http.Transport {
 		// IMDS is link-local: never route it through a proxy
 		// and never follow a redirect that could leak the token elsewhere.
-		transport := http.DefaultTransport.(*http.Transport).Clone() //nolint:forcetypeassert
+		var transport *http.Transport
+
+		if defaultTransport, ok := http.DefaultTransport.(*http.Transport); ok && defaultTransport != nil {
+			transport = defaultTransport.Clone()
+		} else {
+			transport = &http.Transport{}
+		}
+
 		transport.Proxy = nil
 
 		return transport

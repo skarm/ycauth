@@ -403,3 +403,61 @@ func TestIssuerContainsTokenProviderPanic(t *testing.T) {
 		t.Fatalf("Retrieve() during backoff error = %v, want ErrBackoff", err)
 	}
 }
+
+type brokenError struct{}
+
+func (brokenError) Error() string { return "IAM unavailable" }
+
+func (brokenError) Unwrap() error { panic("Unwrap exploded") }
+
+func TestIssuerCountsPanickingTokenProviderErrorOnce(t *testing.T) {
+	t.Parallel()
+
+	policy, err := PrefixPolicy("bucket", "", PermissionReadObject)
+	if err != nil {
+		t.Fatalf("PrefixPolicy() error = %v", err)
+	}
+	var calls atomic.Int64
+	provider, _, err := newCredentialsIssuer(ycauth.TokenProviderFunc(func(context.Context) (ycauth.Token, error) {
+		calls.Add(1)
+		return ycauth.Token{}, brokenError{}
+	}), Config{SessionName: "session", SessionPolicy: policy})
+	if err != nil {
+		t.Fatalf("newCredentialsIssuer() error = %v", err)
+	}
+	now := time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)
+	provider.now = func() time.Time { return now }
+
+	credentials, err := provider.Retrieve(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "panicked") || credentials.HasKeys() {
+		t.Fatalf("Retrieve() = (%#v, %v), want a contained panic", credentials, err)
+	}
+	if provider.failures != 1 {
+		t.Fatalf("failures = %d, want 1", provider.failures)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := provider.Retrieve(context.Background())
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, ycauth.ErrBackoff) {
+			t.Fatalf("Retrieve() during backoff error = %v, want ErrBackoff", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Retrieve() after a panicking error did not return")
+	}
+	if provider.failures != 1 || calls.Load() != 1 {
+		t.Fatalf("during backoff: failures = %d, source calls = %d, want 1 each", provider.failures, calls.Load())
+	}
+
+	now = provider.nextAttemptAt
+	if _, err := provider.Retrieve(context.Background()); err == nil || !strings.Contains(err.Error(), "panicked") {
+		t.Fatalf("Retrieve() after backoff error = %v, want a contained panic", err)
+	}
+	if provider.failures != 2 || calls.Load() != 2 {
+		t.Fatalf("after retry: failures = %d, source calls = %d, want 2 each", provider.failures, calls.Load())
+	}
+}

@@ -155,6 +155,12 @@ bounded to a few minutes, so one response cannot suspend refreshes for as long
 as the server likes. The body is untrusted and can be sensitive, so avoid
 logging it indiscriminately.
 
+Permanent authentication failures, such as HTTP 401/403 after a key is revoked,
+do not stop retries: subsequent `Token` calls can trigger new attempts after
+exponential backoff with a maximum delay, without an attempt limit. Use
+`var apiErr *ycauth.APIError` with `errors.As(err, &apiErr)` and check
+`apiErr.Temporary()` to decide whether the application should stop retrying.
+
 ## Object Storage with AWS SDK v2
 
 `s3iam.New` requests ephemeral AWS-compatible credentials and returns an
@@ -402,8 +408,8 @@ create cloud resources or discover database endpoints.
   direct access to `Token.Value` is still sensitive.
 - HTTP responses, key files, and policy documents are validated. A nil token
   source or provider is rejected where it is supplied: constructors return an
-  error, and the `pgxiam` hook builders panic. A nil context is a programmer
-  error.
+  error, and the `pgxiam` hook builders panic. `Cache.Token` rejects a nil
+  context with an error, whether or not a token is cached.
 - Prefer `imds` on Compute Cloud. It avoids distributing a service-account
   private key to the workload.
 - Keep one `Cache` and one AWS credentials cache per identity/configuration;
