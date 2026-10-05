@@ -3,14 +3,18 @@ package authzkey //nolint:testpackage
 import (
 	"bytes"
 	"context"
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -23,7 +27,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/skarm/ycauth"
 )
 
@@ -60,26 +63,10 @@ func TestSourceAcquire(t *testing.T) {
 			return
 		}
 
-		claims := &jwt.RegisteredClaims{}
-		parsed, err := jwt.ParseWithClaims(body.JWT, claims, func(token *jwt.Token) (any, error) {
-			if token.Header["kid"] != "key-id" {
-				return nil, errors.New("unexpected JWT key ID")
-			}
-			return &key.PublicKey, nil
-		}, jwt.WithValidMethods([]string{"PS256"}), jwt.WithAudience(tokenAudience), jwt.WithIssuer("service-account-id"), jwt.WithTimeFunc(func() time.Time { return now }))
-		if err != nil || !parsed.Valid {
-			t.Errorf("parse JWT = (%v, %v)", parsed, err)
+		if err := verifyExchangeJWT(body.JWT, &key.PublicKey, now); err != nil {
+			t.Errorf("verify JWT: %v", err)
 			writer.WriteHeader(http.StatusUnauthorized)
 			return
-		}
-		if claims.NotBefore == nil || !claims.NotBefore.Equal(claims.IssuedAt.Time) {
-			t.Errorf("JWT nbf = %v, want iat %v", claims.NotBefore, claims.IssuedAt)
-		}
-		if got := claims.IssuedAt.Sub(now); got != -clockSkew {
-			t.Errorf("JWT iat offset = %s, want -%s", got, clockSkew)
-		}
-		if got := claims.ExpiresAt.Sub(claims.IssuedAt.Time); got != jwtLifetime+clockSkew {
-			t.Errorf("JWT lifetime = %s, want %s", got, jwtLifetime+clockSkew)
 		}
 
 		writer.Header().Set("Content-Type", "application/json")
@@ -99,6 +86,62 @@ func TestSourceAcquire(t *testing.T) {
 	if token.Value != "iam-token" || !token.ExpiresAt.Equal(expiresAt) {
 		t.Fatalf("Acquire() = %v", token)
 	}
+}
+
+// verifyExchangeJWT checks the wire format and signature independently of the JWT library.
+func verifyExchangeJWT(signed string, key *rsa.PublicKey, now time.Time) error {
+	parts := strings.Split(signed, ".")
+	if len(parts) != 3 {
+		return errors.New("JWT must have three segments")
+	}
+
+	signature, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil {
+		return fmt.Errorf("decode JWT signature: %w", err)
+	}
+	digest := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
+	if err := rsa.VerifyPSS(key, crypto.SHA256, digest[:], signature, &rsa.PSSOptions{SaltLength: rsa.PSSSaltLengthEqualsHash}); err != nil {
+		return fmt.Errorf("verify PS256 signature: %w", err)
+	}
+
+	headerData, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return fmt.Errorf("decode JWT header: %w", err)
+	}
+	var header struct {
+		Algorithm string `json:"alg"`
+		KeyID     string `json:"kid"`
+		Type      string `json:"typ"`
+	}
+	if err := json.Unmarshal(headerData, &header); err != nil {
+		return fmt.Errorf("parse JWT header: %w", err)
+	}
+	if header.Algorithm != "PS256" || header.KeyID != "key-id" || header.Type != "JWT" {
+		return fmt.Errorf("unexpected JWT header: %+v", header)
+	}
+
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return fmt.Errorf("decode JWT claims: %w", err)
+	}
+	var claims struct {
+		Issuer    string   `json:"iss"`
+		Audience  []string `json:"aud"`
+		IssuedAt  int64    `json:"iat"`
+		NotBefore int64    `json:"nbf"`
+		ExpiresAt int64    `json:"exp"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return fmt.Errorf("parse JWT claims: %w", err)
+	}
+	if claims.Issuer != "service-account-id" || len(claims.Audience) != 1 || claims.Audience[0] != tokenAudience {
+		return fmt.Errorf("unexpected JWT issuer or audience: %+v", claims)
+	}
+	if claims.IssuedAt != now.Add(-clockSkew).Unix() || claims.NotBefore != claims.IssuedAt || claims.ExpiresAt != now.Add(jwtLifetime).Unix() {
+		return fmt.Errorf("unexpected JWT timestamps: %+v", claims)
+	}
+
+	return nil
 }
 
 func TestSourceAcquireResponseValidation(t *testing.T) {

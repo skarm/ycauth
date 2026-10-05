@@ -15,7 +15,7 @@ Use only the modules your application needs:
 - `github.com/skarm/ycauth/pgxiam` — IAM authentication for new pgx physical
   connections.
 
-All modules require Go 1.25 or later. Add a released version of each required
+All modules require Go 1.27 or later. Add a released version of each required
 module to `go.mod`:
 
 ```bash

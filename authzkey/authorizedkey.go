@@ -20,7 +20,9 @@ import (
 	"github.com/skarm/ycauth"
 	"github.com/skarm/ycauth/internal/httpx"
 
-	"github.com/golang-jwt/jwt/v5"
+	"github.com/lestrrat-go/jwx/v4/jwa"
+	"github.com/lestrrat-go/jwx/v4/jws"
+	"github.com/lestrrat-go/jwx/v4/jwt"
 )
 
 const (
@@ -241,21 +243,32 @@ func (s *Source) acquireOnce(ctx context.Context) (ycauth.Token, bool, error) {
 // signedJWT creates the short-lived PS256 assertion required by IAM.
 func (s *Source) signedJWT(now time.Time) (string, error) {
 	issuedAt := now.Add(-clockSkew)
-	token := jwt.NewWithClaims(jwt.SigningMethodPS256, jwt.RegisteredClaims{
-		Issuer:    s.serviceAccountID,
-		Audience:  jwt.ClaimStrings{tokenAudience},
-		IssuedAt:  jwt.NewNumericDate(issuedAt),
-		NotBefore: jwt.NewNumericDate(issuedAt),
-		ExpiresAt: jwt.NewNumericDate(now.Add(jwtLifetime)),
-	})
-	token.Header["kid"] = s.keyID
 
-	signed, err := token.SignedString(s.privateKey)
+	token, err := jwt.NewBuilder().
+		Issuer(s.serviceAccountID).
+		Audience([]string{tokenAudience}).
+		IssuedAt(issuedAt).
+		NotBefore(issuedAt).
+		Expiration(now.Add(jwtLifetime)).
+		Build()
+	if err != nil {
+		return "", fmt.Errorf("build service-account JWT: %w", err)
+	}
+
+	// Preserve the audience array regardless of application-wide jwx settings.
+	token.Options().Disable(jwt.FlattenAudience)
+
+	headers := jws.NewHeaders()
+	if err := headers.Set(jws.KeyIDKey, s.keyID); err != nil {
+		return "", fmt.Errorf("set service-account JWT key ID: %w", err)
+	}
+
+	signed, err := jwt.Sign(token, jwt.WithKey(jwa.PS256(), s.privateKey, jws.WithProtectedHeaders(headers)))
 	if err != nil {
 		return "", fmt.Errorf("sign service-account JWT: %w", err)
 	}
 
-	return signed, nil
+	return string(signed), nil
 }
 
 // parsePrivateKey accepts an unencrypted RSA key in PKCS #1 or PKCS #8 PEM
