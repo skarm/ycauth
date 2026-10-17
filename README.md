@@ -217,6 +217,10 @@ contain policy metacharacters (`*`, `?`, `$`) or control characters.
   and implies the same `s3:PutObject` grant as `PermissionWriteObject`.
 - `PermissionBucketLocation` permits reading the bucket location.
 
+For a non-empty prefix such as `tenant/42`, listing requests must use
+`prefix=tenant/42/` or a deeper prefix. Omitting the trailing slash could also
+list similarly named siblings such as `tenant/420`, so that request is denied.
+
 An empty prefix deliberately covers the whole bucket, so pass one only when that
 is intended: an unset variable widens the policy instead of failing.
 

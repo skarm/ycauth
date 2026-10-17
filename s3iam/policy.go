@@ -58,12 +58,16 @@ type SessionPolicy struct {
 // JSON returns the compact JSON policy document accepted by Yandex Cloud.
 func (p SessionPolicy) JSON() string { return p.document }
 
-// RawPolicy validates and compacts one custom JSON object. The compact document
-// must not exceed 2,048 Unicode characters.
+// RawPolicy validates and compacts one custom UTF-8 JSON object. The compact
+// document must not exceed 2,048 Unicode characters.
 func RawPolicy(data []byte) (SessionPolicy, error) {
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) == 0 || trimmed[0] != '{' {
 		return SessionPolicy{}, errors.New("create S3 policy: JSON document must be a non-empty object")
+	}
+
+	if !utf8.Valid(trimmed) {
+		return SessionPolicy{}, errors.New("create S3 policy: JSON document must be valid UTF-8")
 	}
 
 	// Compact validates the syntax while it rewrites, so no separate parse.
@@ -78,6 +82,8 @@ func RawPolicy(data []byte) (SessionPolicy, error) {
 // PrefixPolicy builds a least-privilege policy for one bucket and object prefix.
 // It rejects prefixes that begin or end with a slash or contain policy
 // metacharacters, control characters, or invalid UTF-8.
+// Listing requests must use the prefix followed by a slash (or a deeper prefix)
+// so that similarly named sibling prefixes cannot be listed.
 //
 // An empty prefix deliberately covers the whole bucket, so pass one only when
 // that is intended: an unset variable widens the policy rather than failing.
@@ -168,7 +174,7 @@ func prefixStatements(bucket, prefix string, permissions Permissions) ([]policyS
 
 		if prefix != "" {
 			statement.Condition = map[string]map[string][]string{
-				"StringLike": {"s3:prefix": {prefix, prefix + "/*"}},
+				"StringLike": {"s3:prefix": {prefix + "/*"}},
 			}
 		}
 

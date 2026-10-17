@@ -11,6 +11,7 @@ func FuzzRawPolicy(f *testing.F) {
 	for _, seed := range []string{
 		"", "{}", "   ", "null", "[]", `{"Version":"2012-10-17"}`,
 		`{"Version":"2012-10-17","Statement":[]}` + "\n\t ", `{"a":`, strings.Repeat("{", 512),
+		"{\"Resource\":\"invalid\xff\"}",
 	} {
 		f.Add(seed)
 	}
@@ -27,6 +28,10 @@ func FuzzRawPolicy(f *testing.F) {
 
 		if !json.Valid([]byte(policy.JSON())) {
 			t.Fatalf("RawPolicy() produced invalid JSON: %q", policy.JSON())
+		}
+
+		if !utf8.ValidString(policy.JSON()) {
+			t.Fatalf("RawPolicy() produced invalid UTF-8: %q", policy.JSON())
 		}
 
 		if count := utf8.RuneCountInString(policy.JSON()); count > maxPolicyLength {

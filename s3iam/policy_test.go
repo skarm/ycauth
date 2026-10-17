@@ -3,6 +3,7 @@ package s3iam //nolint:testpackage // White-box assertions verify the generated 
 import (
 	"encoding/json"
 	"reflect"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -26,13 +27,13 @@ func TestPrefixPoliciesKeepsGrantsIndependent(t *testing.T) {
 	}
 	want := policyDocument{Version: "2012-10-17", Statement: []policyStatement{
 		{Effect: "Allow", Principal: "*", Action: []string{"s3:ListBucket"}, Resource: []string{"arn:aws:s3:::source-bucket"},
-			Condition: map[string]map[string][]string{"StringLike": {"s3:prefix": {"incoming", "incoming/*"}}}},
+			Condition: map[string]map[string][]string{"StringLike": {"s3:prefix": {"incoming/*"}}}},
 		{Effect: "Allow", Principal: "*", Action: []string{"s3:GetObject"}, Resource: []string{"arn:aws:s3:::source-bucket/incoming/*"}},
 		{Effect: "Allow", Principal: "*", Action: []string{"s3:ListBucket"}, Resource: []string{"arn:aws:s3:::target-bucket"},
-			Condition: map[string]map[string][]string{"StringLike": {"s3:prefix": {"processed", "processed/*"}}}},
+			Condition: map[string]map[string][]string{"StringLike": {"s3:prefix": {"processed/*"}}}},
 		{Effect: "Allow", Principal: "*", Action: []string{"s3:PutObject"}, Resource: []string{"arn:aws:s3:::target-bucket/processed/*"}},
 		{Effect: "Allow", Principal: "*", Action: []string{"s3:ListBucket"}, Resource: []string{"arn:aws:s3:::source-bucket"},
-			Condition: map[string]map[string][]string{"StringLike": {"s3:prefix": {"archive", "archive/*"}}}},
+			Condition: map[string]map[string][]string{"StringLike": {"s3:prefix": {"archive/*"}}}},
 		{Effect: "Allow", Principal: "*", Action: []string{"s3:DeleteObject"}, Resource: []string{"arn:aws:s3:::source-bucket/archive/*"}},
 	}}
 	if !reflect.DeepEqual(got, want) {
@@ -139,7 +140,7 @@ func TestPrefixPolicy(t *testing.T) {
 		t.Fatalf("list statement = %#v", list)
 	}
 	prefixes := list.Condition["StringLike"]["s3:prefix"]
-	if len(prefixes) != 2 || prefixes[0] != "tenant/42" || prefixes[1] != "tenant/42/*" {
+	if len(prefixes) != 1 || prefixes[0] != "tenant/42/*" {
 		t.Fatalf("prefix condition = %#v", prefixes)
 	}
 
@@ -167,6 +168,51 @@ func TestMultipartPolicyDoesNotGrantBucketWideListing(t *testing.T) {
 	}
 	if strings.Contains(policy.JSON(), "s3:ListBucketMultipartUploads") {
 		t.Fatalf("policy grants bucket-wide multipart listing: %s", policy.JSON())
+	}
+}
+
+func TestPrefixPolicyListingStaysWithinObjectPrefix(t *testing.T) {
+	t.Parallel()
+
+	policy, err := PrefixPolicy("bucket", "tenant/42", PermissionReadObject|PermissionListObjects)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document policyDocument
+	if err := json.Unmarshal([]byte(policy.JSON()), &document); err != nil {
+		t.Fatal(err)
+	}
+
+	// StringLike checks the request's prefix, not each returned key. Permitting
+	// prefix=tenant/42 would also expose tenant/420/private via ListObjects.
+	for _, testCase := range []struct {
+		prefix  string
+		allowed bool
+	}{
+		{prefix: ""},
+		{prefix: "tenant/"},
+		{prefix: "tenant/42"},
+		{prefix: "tenant/420/"},
+		{prefix: "tenant/42/", allowed: true},
+		{prefix: "tenant/42/nested/", allowed: true},
+	} {
+		allowed := false
+		for _, statement := range document.Statement {
+			if !contains(statement.Action, "s3:ListBucket") {
+				continue
+			}
+			for _, pattern := range statement.Condition["StringLike"]["s3:prefix"] {
+				expression := "^" + strings.ReplaceAll(regexp.QuoteMeta(pattern), `\*`, ".*") + "$"
+				matched, err := regexp.MatchString(expression, testCase.prefix)
+				if err != nil {
+					t.Fatal(err)
+				}
+				allowed = allowed || matched
+			}
+		}
+		if allowed != testCase.allowed {
+			t.Errorf("listing prefix %q allowed = %v, want %v", testCase.prefix, allowed, testCase.allowed)
+		}
 	}
 }
 
@@ -213,6 +259,17 @@ func TestRawPolicy(t *testing.T) {
 	}
 	if _, err := RawPolicy([]byte(`{"x":"` + strings.Repeat("x", maxPolicyLength) + `"}`)); err == nil {
 		t.Fatal("RawPolicy(oversized) error = nil")
+	}
+}
+
+func TestRawPolicyRejectsInvalidUTF8(t *testing.T) {
+	t.Parallel()
+
+	// json.Compact accepts this byte, but marshaling the credential request
+	// replaces it with U+FFFD and silently changes the policy's resource.
+	policy, err := RawPolicy([]byte("{\"Resource\":\"arn:aws:s3:::bucket/invalid\xff\"}"))
+	if err == nil || policy.JSON() != "" {
+		t.Fatalf("RawPolicy(invalid UTF-8) = (%q, %v), want an empty policy and error", policy.JSON(), err)
 	}
 }
 
