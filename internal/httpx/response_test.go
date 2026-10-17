@@ -116,6 +116,37 @@ func TestResponseError(t *testing.T) {
 	}
 }
 
+type brokenBody struct{}
+
+func (brokenBody) Read(buffer []byte) (int, error) {
+	return copy(buffer, "partial response"), io.ErrUnexpectedEOF
+}
+
+func TestResponseErrorPreservesStatusWhenBodyReadFails(t *testing.T) {
+	t.Parallel()
+
+	response := &http.Response{
+		StatusCode: http.StatusTooManyRequests,
+		Header: http.Header{
+			"Retry-After":  {"7"},
+			"X-Request-Id": {"request-id"},
+		},
+		Body: io.NopCloser(brokenBody{}),
+	}
+	err := ResponseError("exchange token", response, time.Now())
+	var apiErr *ycauth.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("ResponseError() = %v, want the HTTP status preserved as APIError", err)
+	}
+	if apiErr.StatusCode != http.StatusTooManyRequests || apiErr.RequestID != "request-id" ||
+		apiErr.RetryAfter != 7*time.Second || apiErr.Body != "partial response" {
+		t.Fatalf("APIError = %#v", apiErr)
+	}
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("ResponseError() = %v, want the body read error preserved", err)
+	}
+}
+
 func TestRetryAfter(t *testing.T) {
 	t.Parallel()
 

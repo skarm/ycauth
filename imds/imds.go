@@ -165,8 +165,13 @@ func (s *Source) Acquire(ctx context.Context) (ycauth.Token, error) {
 		return ycauth.Token{}, errors.New("decode IMDS IAM token response: unsupported token type " + strconv.Quote(result.TokenType))
 	}
 
+	expiresAt := issuedAt.Add(time.Duration(result.ExpiresIn) * time.Second).Round(0)
+	if !expiresAt.After(s.now()) {
+		return ycauth.Token{}, errors.New("decode IMDS IAM token response: token expired during the request")
+	}
+
 	return ycauth.Token{
 		Value:     result.AccessToken,
-		ExpiresAt: issuedAt.Add(time.Duration(result.ExpiresIn) * time.Second),
+		ExpiresAt: expiresAt,
 	}, nil
 }

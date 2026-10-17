@@ -53,6 +53,17 @@ func TestDelayHonoursLongerRetryAfter(t *testing.T) {
 	}
 }
 
+func TestDelayNeverJittersBelowRetryAfter(t *testing.T) {
+	t.Parallel()
+
+	for _, hint := range []time.Duration{9 * time.Second, 10 * time.Second, 11 * time.Second, time.Minute} {
+		got := testPolicy().Delay(1, hint, func() float64 { return 0 })
+		if got < hint {
+			t.Errorf("Delay(1, %s) = %s, retries before Retry-After", hint, got)
+		}
+	}
+}
+
 func TestValidate(t *testing.T) {
 	t.Parallel()
 

@@ -147,6 +147,53 @@ func TestCacheDoesNotServeTokenPastAbsoluteExpiration(t *testing.T) {
 	}
 }
 
+type waitHookContext struct {
+	context.Context
+	beforeWait func()
+}
+
+func (ctx waitHookContext) Done() <-chan struct{} {
+	ctx.beforeWait()
+	return ctx.Context.Done()
+}
+
+func TestCacheRechecksExpirationAfterWaitingForRefresh(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)
+	clock := &fakeClock{now: now}
+	events := make(chan RefreshEvent, 2)
+	var calls atomic.Int64
+	cache, err := newCache(TokenSourceFunc(func(context.Context) (Token, error) {
+		if calls.Add(1) == 1 {
+			return Token{Value: "expired-while-waiting", ExpiresAt: now.Add(time.Minute)}, nil
+		}
+		return Token{Value: "fresh", ExpiresAt: clock.Now().Add(time.Hour)}, nil
+	}), CacheConfig{Observer: ObserverFunc(func(event RefreshEvent) { events <- event })}, clock.Now, func() float64 { return 0.5 })
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var paused sync.Once
+	// Pause the waiter at the select boundary until refresh has completed, then
+	// advance the clock as if it was descheduled or the machine was suspended.
+	waiter := waitHookContext{Context: ctx, beforeWait: func() {
+		paused.Do(func() {
+			select {
+			case <-events:
+				clock.Advance(time.Minute)
+			case <-ctx.Done():
+				t.Fatal("refresh did not complete")
+			}
+		})
+	}}
+	token, err := cache.Token(waiter)
+	if err != nil || token.Value != "fresh" || !token.ValidAt(clock.Now()) {
+		t.Fatalf("Token() = (%v, %v), want a token still valid after the wait", token, err)
+	}
+}
+
 func TestCacheLeaderCancellationDoesNotCancelRefresh(t *testing.T) {
 	t.Parallel()
 
@@ -533,12 +580,65 @@ func TestCacheContainsPanickingSourceError(t *testing.T) {
 	if failures != 1 {
 		t.Fatalf("failures = %d, want 1", failures)
 	}
+	if _, err := cache.Token(ctx); !errors.Is(err, ErrBackoff) {
+		t.Fatalf("Token() during panic backoff error = %v, want ErrBackoff", err)
+	}
 
 	// The panic must not have kept the refresh slot or stranded later callers.
 	clock.Advance(time.Second)
 	token, err := cache.Token(ctx)
 	if err != nil || token.Value != "recovered" {
 		t.Fatalf("Token() after a panicking error = (%v, %v)", token, err)
+	}
+}
+
+func TestCacheRetriesPanickingSourceErrorWhileTokenIsValid(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)
+	clock := &fakeClock{now: now}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	recovered := make(chan struct{})
+	var calls atomic.Int64
+	cache, err := newCache(TokenSourceFunc(func(context.Context) (Token, error) {
+		switch calls.Add(1) {
+		case 1:
+			return Token{Value: "old", ExpiresAt: now.Add(time.Hour)}, nil
+		case 2:
+			close(started)
+			<-release
+			return Token{}, brokenError{}
+		default:
+			close(recovered)
+			return Token{Value: "new", ExpiresAt: clock.Now().Add(time.Hour)}, nil
+		}
+	}), CacheConfig{Backoff: BackoffConfig{Initial: time.Second, Max: time.Second, Multiplier: 1}}, clock.Now, func() float64 { return 0.5 })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cache.Token(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(56 * time.Minute)
+	if token, err := cache.Token(context.Background()); err != nil || token.Value != "old" {
+		t.Fatalf("background refresh Token() = (%v, %v)", token, err)
+	}
+	<-started
+	cache.mu.Lock()
+	call := cache.refresh
+	cache.mu.Unlock()
+	close(release)
+	<-call.done
+
+	clock.Advance(time.Second)
+	if _, err := cache.Token(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-recovered:
+	case <-time.After(time.Second):
+		t.Fatal("refresh was not retried after backoff while the old token was still valid")
 	}
 }
 

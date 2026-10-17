@@ -44,8 +44,9 @@ func (p Policy) Validate() error {
 // treats values below one as the first failure.
 //
 // A retryAfter hint longer than the computed delay takes precedence, even when
-// it exceeds [Policy.Max]. Delay calls jitterSource only when [Policy.Jitter]
-// is nonzero; the function must return a value in [0, 1).
+// it exceeds [Policy.Max]. Jitter never shortens the hint. Delay calls
+// jitterSource only when [Policy.Jitter] is nonzero; the function must return a
+// value in [0, 1).
 func (p Policy) Delay(failures int, retryAfter time.Duration, jitterSource func() float64) time.Duration {
 	exponent := math.Pow(p.Multiplier, float64(max(failures, 1)-1))
 
@@ -67,5 +68,5 @@ func (p Policy) Delay(failures int, retryAfter time.Duration, jitterSource func(
 		return p.Max
 	}
 
-	return time.Duration(jittered)
+	return max(retryAfter, time.Duration(jittered))
 }

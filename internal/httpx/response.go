@@ -27,17 +27,20 @@ const (
 // bounds the response-body excerpt, request ID, and Retry-After delay.
 func ResponseError(operation string, response *http.Response, now time.Time) error {
 	body, err := readErrorBody(response.Body, response.ContentLength)
-	if err != nil {
-		return fmt.Errorf("%s: read error response: %w", operation, err)
-	}
 
-	return &ycauth.APIError{
+	apiErr := &ycauth.APIError{
 		Op:         operation,
 		StatusCode: response.StatusCode,
 		Body:       body,
 		RequestID:  requestID(response.Header),
 		RetryAfter: retryAfter(response.Header.Get("Retry-After"), now),
 	}
+
+	if err != nil {
+		return fmt.Errorf("%w: read error response: %w", apiErr, err)
+	}
+
+	return apiErr
 }
 
 // readErrorBody returns a bounded, valid UTF-8 excerpt. When practical, it also
@@ -45,7 +48,7 @@ func ResponseError(operation string, response *http.Response, now time.Time) err
 func readErrorBody(body io.Reader, contentLength int64) (string, error) {
 	data, err := io.ReadAll(io.LimitReader(body, maxErrorBody+1))
 	if err != nil {
-		return "", err
+		return strings.TrimSpace(errorBody(data)), err
 	}
 
 	// A short body has already reached EOF. For a truncated body, consume a

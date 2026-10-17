@@ -119,6 +119,46 @@ func TestSourceAcquireValidation(t *testing.T) {
 	}
 }
 
+type transportFunc func(*http.Request) (*http.Response, error)
+
+func (transport transportFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return transport(request)
+}
+
+func TestSourceAcquireAccountsForElapsedRequestTime(t *testing.T) {
+	t.Parallel()
+
+	for _, elapsed := range []time.Duration{0, 500 * time.Millisecond, time.Second, 2 * time.Second} {
+		t.Run(elapsed.String(), func(t *testing.T) {
+			t.Parallel()
+
+			issuedAt := time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)
+			now := issuedAt
+			client := &http.Client{Transport: transportFunc(func(*http.Request) (*http.Response, error) {
+				now = now.Add(elapsed)
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader(`{"access_token":"token","expires_in":1}`)),
+				}, nil
+			})}
+			source, err := New(WithHTTPClient(client))
+			if err != nil {
+				t.Fatal(err)
+			}
+			source.now = func() time.Time { return now }
+			token, err := source.Acquire(context.Background())
+			if elapsed >= time.Second {
+				if err == nil || token != (ycauth.Token{}) {
+					t.Fatalf("Acquire() = (%v, %v), want rejection of a token expired during the request", token, err)
+				}
+			} else if err != nil || token.Value != "token" || !token.ExpiresAt.Equal(issuedAt.Add(time.Second)) {
+				t.Fatalf("Acquire() = (%v, %v), want the original absolute expiration", token, err)
+			}
+		})
+	}
+}
+
 func TestSourceValidation(t *testing.T) {
 	t.Parallel()
 

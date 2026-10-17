@@ -237,6 +237,12 @@ func (c *Cache) Token(ctx context.Context) (Token, error) {
 		case <-ctx.Done():
 			return Token{}, fmt.Errorf("get IAM token: %w", ctx.Err())
 		case <-call.done:
+			// The waiter may resume long after publication, for example after
+			// machine suspend. Recheck the absolute deadline before returning.
+			if call.result.err == nil && !call.result.token.ValidAt(c.now()) {
+				continue
+			}
+
 			return call.result.token, call.result.err
 		}
 	}
@@ -296,13 +302,13 @@ func (c *Cache) beginRefresh(now time.Time, observed *tokenSnapshot) (*refreshCa
 // observer. Source and observer calls recover locally; abandonRefresh catches
 // any remaining panic, including one from an error method.
 func (c *Cache) runRefresh(call *refreshCall) {
+	startedAt := c.now()
+
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			c.abandonRefresh(call, fmt.Errorf("get IAM token: refresh panicked: %v", recovered))
+			c.abandonRefresh(call, startedAt, fmt.Errorf("get IAM token: refresh panicked: %v", recovered))
 		}
 	}()
-
-	startedAt := c.now()
 
 	token, err := c.acquireToken()
 
@@ -311,21 +317,19 @@ func (c *Cache) runRefresh(call *refreshCall) {
 
 // abandonRefresh releases the refresh slot and any waiters after a panic left
 // the refresh incomplete, so a broken source cannot wedge the cache.
-func (c *Cache) abandonRefresh(call *refreshCall, err error) {
+func (c *Cache) abandonRefresh(call *refreshCall, startedAt time.Time, err error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	pending := c.refresh == call
+	c.mu.Unlock()
 
-	if c.refresh != call {
+	if !pending {
 		return // publish already completed the call; the panic came later.
 	}
 
-	c.failures = min(c.failures+1, backoff.MaxFailures)
-	c.nextAttemptAt = c.now().Add(c.backoff.Delay(c.failures, 0, c.jitterSource))
-	c.backoffErr = err
-	c.refresh = nil
-	call.result = tokenResult{err: err}
-
-	close(call.done)
+	// Only this goroutine completes call; Invalidate leaves it in flight. Use
+	// the normal failure path so stale fallback, retry scheduling, ErrBackoff,
+	// and observer events remain consistent after a caller-controlled panic.
+	c.observe(c.publish(call, startedAt, Token{}, err))
 }
 
 // publish stores the outcome of a refresh, completes call, and returns the
