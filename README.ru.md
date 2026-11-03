@@ -221,25 +221,94 @@ IAM-токена; значение по умолчанию — десять се
 `/` и не может содержать метасимволы политики (`*`, `?`, `$`) либо управляющие
 символы.
 
-- `PermissionReadObject` — скачивание;
-- `PermissionListObjects` — список объектов под выбранным префиксом;
-- `PermissionWriteObject` — загрузка;
-- `PermissionDeleteObject` — удаление;
-- `PermissionMultipartUpload` — операции составной загрузки (multipart) над выбранными объектами; включает то же право `s3:PutObject`, что и `PermissionWriteObject`;
-- `PermissionBucketLocation` — чтение расположения бакета.
+Объединяйте `Permissions` через `|`. Типизированные флаги покрывают все 28 действий
+из [справочника политик Yandex Object Storage](https://yandex.cloud/ru/docs/storage/s3/api-ref/policy/actions).
 
-Для непустого префикса, например `tenant/42`, запрос списка должен содержать
-`prefix=tenant/42/` или более глубокий префикс. Без завершающего слеша запрос
-мог бы показать соседние имена, например `tenant/420`, поэтому он запрещён.
+`AllPermissions` объединяет все отдельные флаги действий. Исключайте нужные
+действия через `&^`, например:
+
+```go
+permissions := s3iam.AllPermissions &^ s3iam.PermissionWriteObject
+policy, err := s3iam.PrefixPolicy("my-bucket", "", permissions)
+if err != nil {
+	return err
+}
+```
+
+Составной флаг `PermissionMultipartUpload` не входит в `AllPermissions`, поэтому
+исключение `PermissionWriteObject` убирает и `s3:PutObject`. `AllPermissions`
+включает изменение настроек бакета: эти права действуют на весь бакет даже
+при непустом префиксе. Значение константы может расширяться при добавлении
+поддержки новых действий в библиотеку.
+
+Права на объекты действуют в пределах выбранного префикса:
+
+- `PermissionReadObject` → `s3:GetObject` (скачивание);
+- `PermissionWriteObject` → `s3:PutObject` (загрузка);
+- `PermissionDeleteObject` → `s3:DeleteObject` (удаление без выбора версии);
+- `PermissionReadObjectVersion` → `s3:GetObjectVersion`;
+- `PermissionDeleteObjectVersion` → `s3:DeleteObjectVersion`;
+- `PermissionReadObjectACL` → `s3:GetObjectAcl`;
+- `PermissionWriteObjectACL` → `s3:PutObjectAcl`;
+- `PermissionReadObjectVersionACL` → `s3:GetObjectVersionAcl`;
+- `PermissionWriteObjectVersionACL` → `s3:PutObjectVersionAcl`;
+- `PermissionAbortMultipartUpload` → `s3:AbortMultipartUpload`;
+- `PermissionListMultipartUploadParts` → `s3:ListMultipartUploadParts`;
+- `PermissionMultipartUpload` объединяет `s3:PutObject`, `s3:AbortMultipartUpload`
+  и `s3:ListMultipartUploadParts`. Отдельные флаги выше позволяют выдать только
+  нужные операции составной загрузки.
+
+Права на получение списков ограничиваются выбранным префиксом:
+
+- `PermissionListObjects` → `s3:ListBucket`;
+- `PermissionListObjectVersions` → `s3:ListBucketVersions`.
+
+Следующие права всегда действуют на весь бакет, даже при непустом префиксе объектов:
+
+- `PermissionBucketLocation` → `s3:GetBucketLocation`;
+- `PermissionListMultipartUploads` → `s3:ListBucketMultipartUploads`;
+- `PermissionReadBucketACL` → `s3:GetBucketAcl`;
+- `PermissionWriteBucketACL` → `s3:PutBucketAcl`;
+- `PermissionReadBucketCORS` → `s3:GetBucketCORS`;
+- `PermissionWriteBucketCORS` → `s3:PutBucketCORS`;
+- `PermissionReadBucketVersioning` → `s3:GetBucketVersioning`;
+- `PermissionWriteBucketVersioning` → `s3:PutBucketVersioning`;
+- `PermissionReadBucketWebsite` → `s3:GetBucketWebsite`;
+- `PermissionWriteBucketWebsite` → `s3:PutBucketWebsite`;
+- `PermissionDeleteBucketWebsite` → `s3:DeleteBucketWebsite`;
+- `PermissionReadBucketEncryption` → `s3:GetEncryptionConfiguration`;
+- `PermissionWriteBucketEncryption` → `s3:PutEncryptionConfiguration`;
+- `PermissionReadBucketLifecycle` → `s3:GetLifecycleConfiguration`;
+- `PermissionWriteBucketLifecycle` → `s3:PutLifecycleConfiguration`.
+
+Для непустого префикса, например `tenant/42`, запрос списка объектов или их версий
+должен содержать `prefix=tenant/42/` или более глубокий префикс. Без завершающего
+слеша запрос мог бы показать соседние имена, например `tenant/420`, поэтому он запрещён.
 
 Пустой префикс намеренно означает весь бакет, поэтому передавайте его только
 осознанно: незаполненная переменная расширит политику, а не вызовет ошибку.
 
 `PermissionMultipartUpload` не выдаёт `s3:ListBucketMultipartUploads`: эта
-операция показывает незавершённые загрузки всего бакета. Используйте `RawPolicy`,
-только если типизированная политика не выражает нужное право. Она проверяет
-синтаксис JSON и уплотняет документ, но не может доказать безопасность
-произвольной политики. Компактный документ должен укладываться в лимит Yandex
+операция показывает незавершённые загрузки всего бакета. При необходимости
+выдайте её явно через `PermissionListMultipartUploads`. Например, чтобы
+настраивать жизненный цикл бакета и просматривать состояние версионирования
+и незавершённые загрузки:
+
+```go
+policy, err := s3iam.PrefixPolicy("my-bucket", "",
+	s3iam.PermissionWriteBucketLifecycle |
+		s3iam.PermissionReadBucketVersioning |
+		s3iam.PermissionListMultipartUploads,
+)
+if err != nil {
+	return err
+}
+```
+
+Используйте `RawPolicy` для собственных условий или политик, которые
+типизированный конструктор не выражает. Она проверяет синтаксис JSON и уплотняет
+документ, но не может доказать безопасность произвольной политики.
+Компактный документ должен укладываться в лимит Yandex
 Cloud в 2048 символов.
 
 Для нескольких бакетов или префиксов одного бакета используйте `PrefixPolicies`:

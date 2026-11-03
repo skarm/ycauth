@@ -76,7 +76,10 @@ func TestPrefixPoliciesRejectsInvalidGrants(t *testing.T) {
 		{Bucket: "bucket", Prefix: "tenant/", Permissions: PermissionReadObject},
 		{Bucket: "bucket", Prefix: "invalid\xff", Permissions: PermissionReadObject},
 		{Bucket: "bucket", Permissions: 0},
+		{Bucket: "bucket", Permissions: 1 << 29},
 		{Bucket: "bucket", Permissions: 1 << 30},
+		{Bucket: "bucket", Permissions: 1 << 31},
+		{Bucket: "bucket", Permissions: AllPermissions | 1<<31},
 	} {
 		policy, err := PrefixPolicies(valid, invalid)
 		if err == nil || policy.JSON() != "" {
@@ -119,7 +122,10 @@ func TestPrefixPoliciesCombinedCharacterLimit(t *testing.T) {
 func TestPrefixPolicy(t *testing.T) {
 	t.Parallel()
 
-	policy, err := PrefixPolicy("bucket", "tenant/42", allPermissions)
+	// Keep the original permission combination as a compatibility check.
+	permissions := PermissionReadObject | PermissionListObjects | PermissionWriteObject |
+		PermissionDeleteObject | PermissionMultipartUpload | PermissionBucketLocation
+	policy, err := PrefixPolicy("bucket", "tenant/42", permissions)
 	if err != nil {
 		t.Fatalf("PrefixPolicy() error = %v", err)
 	}
@@ -159,6 +165,216 @@ func TestPrefixPolicy(t *testing.T) {
 	}
 }
 
+func TestPrefixPolicyIndividualPermissions(t *testing.T) {
+	t.Parallel()
+
+	// Expected actions and scopes are the public contract, independent of the
+	// implementation's action groups. Extra actions would widen credentials.
+	tests := []struct {
+		name       string
+		permission Permissions
+		actions    []string
+		scope      string
+	}{
+		{"ReadObject", PermissionReadObject, []string{"s3:GetObject"}, "object"},
+		{"ListObjects", PermissionListObjects, []string{"s3:ListBucket"}, "listing"},
+		{"WriteObject", PermissionWriteObject, []string{"s3:PutObject"}, "object"},
+		{"DeleteObject", PermissionDeleteObject, []string{"s3:DeleteObject"}, "object"},
+		{"MultipartUpload", PermissionMultipartUpload, []string{"s3:PutObject", "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts"}, "object"},
+		{"BucketLocation", PermissionBucketLocation, []string{"s3:GetBucketLocation"}, "bucket"},
+		{"ReadObjectVersion", PermissionReadObjectVersion, []string{"s3:GetObjectVersion"}, "object"},
+		{"DeleteObjectVersion", PermissionDeleteObjectVersion, []string{"s3:DeleteObjectVersion"}, "object"},
+		{"ListObjectVersions", PermissionListObjectVersions, []string{"s3:ListBucketVersions"}, "listing"},
+		{"ReadObjectACL", PermissionReadObjectACL, []string{"s3:GetObjectAcl"}, "object"},
+		{"WriteObjectACL", PermissionWriteObjectACL, []string{"s3:PutObjectAcl"}, "object"},
+		{"ReadObjectVersionACL", PermissionReadObjectVersionACL, []string{"s3:GetObjectVersionAcl"}, "object"},
+		{"WriteObjectVersionACL", PermissionWriteObjectVersionACL, []string{"s3:PutObjectVersionAcl"}, "object"},
+		{"AbortMultipartUpload", PermissionAbortMultipartUpload, []string{"s3:AbortMultipartUpload"}, "object"},
+		{"ListMultipartUploadParts", PermissionListMultipartUploadParts, []string{"s3:ListMultipartUploadParts"}, "object"},
+		{"ListMultipartUploads", PermissionListMultipartUploads, []string{"s3:ListBucketMultipartUploads"}, "bucket"},
+		{"ReadBucketACL", PermissionReadBucketACL, []string{"s3:GetBucketAcl"}, "bucket"},
+		{"WriteBucketACL", PermissionWriteBucketACL, []string{"s3:PutBucketAcl"}, "bucket"},
+		{"ReadBucketCORS", PermissionReadBucketCORS, []string{"s3:GetBucketCORS"}, "bucket"},
+		{"WriteBucketCORS", PermissionWriteBucketCORS, []string{"s3:PutBucketCORS"}, "bucket"},
+		{"ReadBucketVersioning", PermissionReadBucketVersioning, []string{"s3:GetBucketVersioning"}, "bucket"},
+		{"WriteBucketVersioning", PermissionWriteBucketVersioning, []string{"s3:PutBucketVersioning"}, "bucket"},
+		{"ReadBucketWebsite", PermissionReadBucketWebsite, []string{"s3:GetBucketWebsite"}, "bucket"},
+		{"WriteBucketWebsite", PermissionWriteBucketWebsite, []string{"s3:PutBucketWebsite"}, "bucket"},
+		{"DeleteBucketWebsite", PermissionDeleteBucketWebsite, []string{"s3:DeleteBucketWebsite"}, "bucket"},
+		{"ReadBucketEncryption", PermissionReadBucketEncryption, []string{"s3:GetEncryptionConfiguration"}, "bucket"},
+		{"WriteBucketEncryption", PermissionWriteBucketEncryption, []string{"s3:PutEncryptionConfiguration"}, "bucket"},
+		{"ReadBucketLifecycle", PermissionReadBucketLifecycle, []string{"s3:GetLifecycleConfiguration"}, "bucket"},
+		{"WriteBucketLifecycle", PermissionWriteBucketLifecycle, []string{"s3:PutLifecycleConfiguration"}, "bucket"},
+	}
+
+	var covered Permissions
+	for _, testCase := range tests {
+		if covered&testCase.permission != 0 {
+			t.Fatalf("permission %s overlaps another permission", testCase.name)
+		}
+		covered |= testCase.permission
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			for _, prefix := range []string{"", "tenant/42"} {
+				policy, err := PrefixPolicy("bucket", prefix, testCase.permission)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var got policyDocument
+				if err := json.Unmarshal([]byte(policy.JSON()), &got); err != nil {
+					t.Fatal(err)
+				}
+				wantStatement := policyStatement{
+					Effect: "Allow", Principal: "*", Action: testCase.actions,
+					Resource: []string{"arn:aws:s3:::bucket"},
+				}
+				if testCase.scope == "object" {
+					wantStatement.Resource[0] += "/"
+					if prefix != "" {
+						wantStatement.Resource[0] += prefix + "/"
+					}
+					wantStatement.Resource[0] += "*"
+				}
+				if testCase.scope == "listing" && prefix != "" {
+					wantStatement.Condition = map[string]map[string][]string{
+						"StringLike": {"s3:prefix": {"tenant/42/*"}},
+					}
+				}
+				want := policyDocument{Version: "2012-10-17", Statement: []policyStatement{wantStatement}}
+				if !reflect.DeepEqual(got, want) {
+					t.Errorf("prefix %q: policy = %s, want %#v", prefix, policy.JSON(), want)
+				}
+			}
+		})
+	}
+	if covered != supportedPermissions {
+		t.Errorf("tested permissions = %#x, want %#x", covered, supportedPermissions)
+	}
+}
+
+func TestPrefixPolicyAllPermissions(t *testing.T) {
+	t.Parallel()
+
+	policy, err := PrefixPolicy("bucket", "tenant/42", AllPermissions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got policyDocument
+	if err := json.Unmarshal([]byte(policy.JSON()), &got); err != nil {
+		t.Fatal(err)
+	}
+	want := policyDocument{Version: "2012-10-17", Statement: []policyStatement{
+		{Effect: "Allow", Principal: "*", Action: []string{"s3:ListBucket", "s3:ListBucketVersions"},
+			Resource:  []string{"arn:aws:s3:::bucket"},
+			Condition: map[string]map[string][]string{"StringLike": {"s3:prefix": {"tenant/42/*"}}}},
+		{Effect: "Allow", Principal: "*", Action: []string{
+			"s3:GetBucketLocation", "s3:ListBucketMultipartUploads", "s3:GetBucketAcl", "s3:PutBucketAcl",
+			"s3:GetBucketCORS", "s3:PutBucketCORS", "s3:GetBucketVersioning", "s3:PutBucketVersioning",
+			"s3:GetBucketWebsite", "s3:PutBucketWebsite", "s3:DeleteBucketWebsite",
+			"s3:GetEncryptionConfiguration", "s3:PutEncryptionConfiguration",
+			"s3:GetLifecycleConfiguration", "s3:PutLifecycleConfiguration",
+		}, Resource: []string{"arn:aws:s3:::bucket"}},
+		{Effect: "Allow", Principal: "*", Action: []string{
+			"s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts",
+			"s3:GetObjectVersion", "s3:DeleteObjectVersion", "s3:GetObjectAcl", "s3:PutObjectAcl",
+			"s3:GetObjectVersionAcl", "s3:PutObjectVersionAcl",
+		}, Resource: []string{"arn:aws:s3:::bucket/tenant/42/*"}},
+	}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("policy = %s, want %#v", policy.JSON(), want)
+	}
+	withMultipartBundle, err := PrefixPolicy("bucket", "tenant/42", AllPermissions|PermissionMultipartUpload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withMultipartBundle.JSON() != policy.JSON() {
+		t.Fatalf("multipart bundle duplicates or changes actions: %s", withMultipartBundle.JSON())
+	}
+}
+
+func TestAllPermissionsCanExcludeIndividualActions(t *testing.T) {
+	t.Parallel()
+
+	// The legacy multipart bundle must not restore actions removed from the
+	// public mask. Every individual flag must control exactly one action.
+	if AllPermissions&PermissionMultipartUpload != 0 {
+		t.Fatal("AllPermissions contains the overlapping multipart-upload bundle")
+	}
+	for permission := Permissions(1); permission != 0; permission <<= 1 {
+		if AllPermissions&permission == 0 {
+			continue
+		}
+		selected, err := PrefixPolicy("bucket", "tenant/42", permission)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var selectedDocument policyDocument
+		if err := json.Unmarshal([]byte(selected.JSON()), &selectedDocument); err != nil {
+			t.Fatal(err)
+		}
+		if len(selectedDocument.Statement) != 1 || len(selectedDocument.Statement[0].Action) != 1 {
+			t.Fatalf("permission %#x must grant exactly one action: %s", permission, selected.JSON())
+		}
+		excludedAction := selectedDocument.Statement[0].Action[0]
+		policy, err := PrefixPolicy("bucket", "tenant/42", AllPermissions&^permission)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var document policyDocument
+		if err := json.Unmarshal([]byte(policy.JSON()), &document); err != nil {
+			t.Fatal(err)
+		}
+		actions := make(map[string]bool)
+		for _, statement := range document.Statement {
+			for _, action := range statement.Action {
+				actions[action] = true
+			}
+		}
+		if actions[excludedAction] || len(actions) != 27 {
+			t.Errorf("excluding %s leaves %d actions: %s", excludedAction, len(actions), policy.JSON())
+		}
+	}
+}
+
+func TestPermissionsPreserveExistingValues(t *testing.T) {
+	t.Parallel()
+
+	got := []Permissions{PermissionReadObject, PermissionListObjects, PermissionWriteObject,
+		PermissionDeleteObject, PermissionMultipartUpload, PermissionBucketLocation}
+	want := []Permissions{1, 2, 4, 8, 16, 32}
+	if !slices.Equal(got, want) {
+		t.Fatalf("existing permission values = %v, want %v", got, want)
+	}
+}
+
+func TestPrefixPoliciesMixedPermissionScopes(t *testing.T) {
+	t.Parallel()
+
+	policy, err := PrefixPolicies(
+		PrefixGrant{Bucket: "source-bucket", Prefix: "incoming",
+			Permissions: PermissionReadObjectVersion | PermissionListObjectVersions},
+		PrefixGrant{Bucket: "target-bucket", Prefix: "processed",
+			Permissions: PermissionWriteObjectACL | PermissionReadBucketCORS | PermissionListMultipartUploads},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got policyDocument
+	if err := json.Unmarshal([]byte(policy.JSON()), &got); err != nil {
+		t.Fatal(err)
+	}
+	want := policyDocument{Version: "2012-10-17", Statement: []policyStatement{
+		{Effect: "Allow", Principal: "*", Action: []string{"s3:ListBucketVersions"}, Resource: []string{"arn:aws:s3:::source-bucket"},
+			Condition: map[string]map[string][]string{"StringLike": {"s3:prefix": {"incoming/*"}}}},
+		{Effect: "Allow", Principal: "*", Action: []string{"s3:GetObjectVersion"}, Resource: []string{"arn:aws:s3:::source-bucket/incoming/*"}},
+		{Effect: "Allow", Principal: "*", Action: []string{"s3:ListBucketMultipartUploads", "s3:GetBucketCORS"}, Resource: []string{"arn:aws:s3:::target-bucket"}},
+		{Effect: "Allow", Principal: "*", Action: []string{"s3:PutObjectAcl"}, Resource: []string{"arn:aws:s3:::target-bucket/processed/*"}},
+	}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("policy = %s, want %#v", policy.JSON(), want)
+	}
+}
+
 func TestMultipartPolicyDoesNotGrantBucketWideListing(t *testing.T) {
 	t.Parallel()
 
@@ -174,7 +390,7 @@ func TestMultipartPolicyDoesNotGrantBucketWideListing(t *testing.T) {
 func TestPrefixPolicyListingStaysWithinObjectPrefix(t *testing.T) {
 	t.Parallel()
 
-	policy, err := PrefixPolicy("bucket", "tenant/42", PermissionReadObject|PermissionListObjects)
+	policy, err := PrefixPolicy("bucket", "tenant/42", PermissionListObjects|PermissionListObjectVersions)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,7 +414,7 @@ func TestPrefixPolicyListingStaysWithinObjectPrefix(t *testing.T) {
 	} {
 		allowed := false
 		for _, statement := range document.Statement {
-			if !contains(statement.Action, "s3:ListBucket") {
+			if !contains(statement.Action, "s3:ListBucket") || !contains(statement.Action, "s3:ListBucketVersions") {
 				continue
 			}
 			for _, pattern := range statement.Condition["StringLike"]["s3:prefix"] {
@@ -227,7 +443,10 @@ func TestPrefixPolicyRequiresExplicitPermissions(t *testing.T) {
 		{bucket: "bad bucket", permissions: PermissionReadObject},
 		{bucket: "bad*bucket", permissions: PermissionReadObject},
 		{bucket: "bucket", permissions: 0},
+		{bucket: "bucket", permissions: 1 << 29},
 		{bucket: "bucket", permissions: 1 << 30},
+		{bucket: "bucket", permissions: 1 << 31},
+		{bucket: "bucket", permissions: AllPermissions | 1<<31},
 	} {
 		if _, err := PrefixPolicy(testCase.bucket, "", testCase.permissions); err == nil {
 			t.Fatalf("PrefixPolicy(%q, %d) error = nil", testCase.bucket, testCase.permissions)
@@ -304,7 +523,7 @@ func BenchmarkPrefixPolicy(b *testing.B) {
 	b.ReportAllocs()
 
 	for b.Loop() {
-		if _, err := PrefixPolicy("bucket", "tenant/42", allPermissions); err != nil {
+		if _, err := PrefixPolicy("bucket", "tenant/42", AllPermissions); err != nil {
 			b.Fatal(err)
 		}
 	}

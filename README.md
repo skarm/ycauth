@@ -209,27 +209,94 @@ The bucket name is validated against Object Storage naming rules. The prefix is
 used exactly as supplied: it must not begin or end with `/`, and it may not
 contain policy metacharacters (`*`, `?`, `$`) or control characters.
 
-- `PermissionReadObject` permits downloads.
-- `PermissionListObjects` permits listing under the selected prefix.
-- `PermissionWriteObject` permits uploads.
-- `PermissionDeleteObject` permits deletion.
-- `PermissionMultipartUpload` permits multipart operations on selected objects,
-  and implies the same `s3:PutObject` grant as `PermissionWriteObject`.
-- `PermissionBucketLocation` permits reading the bucket location.
+Combine `Permissions` with `|`. Typed flags cover all 28 actions in the
+[Yandex Object Storage policy action reference](https://yandex.cloud/en/docs/storage/s3/api-ref/policy/actions).
 
-For a non-empty prefix such as `tenant/42`, listing requests must use
-`prefix=tenant/42/` or a deeper prefix. Omitting the trailing slash could also
+`AllPermissions` combines all individual action flags. Use `&^` to exclude
+specific actions, for example:
+
+```go
+permissions := s3iam.AllPermissions &^ s3iam.PermissionWriteObject
+policy, err := s3iam.PrefixPolicy("my-bucket", "", permissions)
+if err != nil {
+	return err
+}
+```
+
+The overlapping `PermissionMultipartUpload` bundle is omitted from
+`AllPermissions`, so removing `PermissionWriteObject` also removes `s3:PutObject`.
+`AllPermissions` includes bucket configuration changes, which apply to the entire
+bucket even when a non-empty prefix is supplied. Its value may grow when the
+library adds support for more actions.
+
+Object permissions apply to the selected prefix:
+
+- `PermissionReadObject` → `s3:GetObject` (downloads).
+- `PermissionWriteObject` → `s3:PutObject` (uploads).
+- `PermissionDeleteObject` → `s3:DeleteObject` (deletion without selecting a version).
+- `PermissionReadObjectVersion` → `s3:GetObjectVersion`.
+- `PermissionDeleteObjectVersion` → `s3:DeleteObjectVersion`.
+- `PermissionReadObjectACL` → `s3:GetObjectAcl`.
+- `PermissionWriteObjectACL` → `s3:PutObjectAcl`.
+- `PermissionReadObjectVersionACL` → `s3:GetObjectVersionAcl`.
+- `PermissionWriteObjectVersionACL` → `s3:PutObjectVersionAcl`.
+- `PermissionAbortMultipartUpload` → `s3:AbortMultipartUpload`.
+- `PermissionListMultipartUploadParts` → `s3:ListMultipartUploadParts`.
+- `PermissionMultipartUpload` combines `s3:PutObject`, `s3:AbortMultipartUpload`,
+  and `s3:ListMultipartUploadParts`. The individual flags above allow granting
+  only the multipart operations needed.
+
+Listing permissions are restricted by the selected prefix:
+
+- `PermissionListObjects` → `s3:ListBucket`.
+- `PermissionListObjectVersions` → `s3:ListBucketVersions`.
+
+The following permissions always apply to the entire bucket, even when a
+non-empty object prefix is supplied:
+
+- `PermissionBucketLocation` → `s3:GetBucketLocation`.
+- `PermissionListMultipartUploads` → `s3:ListBucketMultipartUploads`.
+- `PermissionReadBucketACL` → `s3:GetBucketAcl`.
+- `PermissionWriteBucketACL` → `s3:PutBucketAcl`.
+- `PermissionReadBucketCORS` → `s3:GetBucketCORS`.
+- `PermissionWriteBucketCORS` → `s3:PutBucketCORS`.
+- `PermissionReadBucketVersioning` → `s3:GetBucketVersioning`.
+- `PermissionWriteBucketVersioning` → `s3:PutBucketVersioning`.
+- `PermissionReadBucketWebsite` → `s3:GetBucketWebsite`.
+- `PermissionWriteBucketWebsite` → `s3:PutBucketWebsite`.
+- `PermissionDeleteBucketWebsite` → `s3:DeleteBucketWebsite`.
+- `PermissionReadBucketEncryption` → `s3:GetEncryptionConfiguration`.
+- `PermissionWriteBucketEncryption` → `s3:PutEncryptionConfiguration`.
+- `PermissionReadBucketLifecycle` → `s3:GetLifecycleConfiguration`.
+- `PermissionWriteBucketLifecycle` → `s3:PutLifecycleConfiguration`.
+
+For a non-empty prefix such as `tenant/42`, object and object-version listing
+requests must use `prefix=tenant/42/` or a deeper prefix. Omitting the trailing slash could also
 list similarly named siblings such as `tenant/420`, so that request is denied.
 
 An empty prefix deliberately covers the whole bucket, so pass one only when that
 is intended: an unset variable widens the policy instead of failing.
 
 `PermissionMultipartUpload` does not grant `s3:ListBucketMultipartUploads`,
-because that operation lists uploads for the entire bucket. Use `RawPolicy`
-only when a typed policy cannot express the needed permission. It validates JSON
-syntax and compacts the document, but cannot prove that an arbitrary policy is
-safe. The compact document must fit Yandex Cloud's 2048-character inline-policy
-limit.
+because that operation lists uploads for the entire bucket. Grant it explicitly
+with `PermissionListMultipartUploads` when needed. For example, to configure
+bucket lifecycle rules and inspect versioning and unfinished uploads:
+
+```go
+policy, err := s3iam.PrefixPolicy("my-bucket", "",
+	s3iam.PermissionWriteBucketLifecycle |
+		s3iam.PermissionReadBucketVersioning |
+		s3iam.PermissionListMultipartUploads,
+)
+if err != nil {
+	return err
+}
+```
+
+Use `RawPolicy` for custom conditions or policies the typed builder cannot
+express. It validates JSON syntax and compacts the document, but cannot prove that
+an arbitrary policy is safe. The compact document must fit Yandex Cloud's
+2048-character inline-policy limit.
 
 For multiple buckets or multiple prefixes in one bucket, use `PrefixPolicies`:
 

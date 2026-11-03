@@ -23,28 +23,97 @@ const (
 
 // Permissions is a bit set of permissions accepted by [PrefixPolicy] and
 // [PrefixPolicies]. Combine permissions with the bitwise OR operator.
+// Use [AllPermissions] to grant every supported action.
+//
+// It covers all actions in the Yandex Object Storage policy action reference:
+// https://yandex.cloud/en/docs/storage/s3/api-ref/policy/actions.
+// Object permissions apply to the configured prefix. With a non-empty prefix,
+// object and version listings require that prefix followed by a slash (or a deeper prefix).
+// Bucket configuration permissions and PermissionListMultipartUploads apply to
+// the entire bucket even when a non-empty object prefix is supplied.
 type Permissions uint32
 
 const (
-	// PermissionReadObject permits downloading objects.
+	// PermissionReadObject permits downloading objects (s3:GetObject).
 	PermissionReadObject Permissions = 1 << iota
-	// PermissionListObjects permits listing objects under the configured prefix.
+	// PermissionListObjects permits listing objects under the prefix (s3:ListBucket).
 	PermissionListObjects
-	// PermissionWriteObject permits uploading objects.
+	// PermissionWriteObject permits uploading objects (s3:PutObject).
 	PermissionWriteObject
-	// PermissionDeleteObject permits deleting objects.
+	// PermissionDeleteObject permits deleting objects without a version ID (s3:DeleteObject).
 	PermissionDeleteObject
-	// PermissionMultipartUpload permits multipart upload operations for objects in
-	// the prefix, including listing parts and aborting an upload. It implies the
-	// same s3:PutObject grant as PermissionWriteObject, because a multipart upload
-	// writes objects. It does not permit listing every multipart upload in the
-	// bucket.
+	// PermissionMultipartUpload permits uploading objects, aborting uploads, and
+	// listing uploaded parts (s3:PutObject, s3:AbortMultipartUpload, and
+	// s3:ListMultipartUploadParts). It does not permit listing uploads in the bucket.
 	PermissionMultipartUpload
-	// PermissionBucketLocation permits reading the bucket location.
+	// PermissionBucketLocation permits reading the bucket location (s3:GetBucketLocation).
 	PermissionBucketLocation
+	// PermissionReadObjectVersion permits downloading specific object versions (s3:GetObjectVersion).
+	PermissionReadObjectVersion
+	// PermissionDeleteObjectVersion permits deleting specific object versions (s3:DeleteObjectVersion).
+	PermissionDeleteObjectVersion
+	// PermissionListObjectVersions permits listing object versions under the prefix (s3:ListBucketVersions).
+	PermissionListObjectVersions
+	// PermissionReadObjectACL permits reading object ACLs (s3:GetObjectAcl).
+	PermissionReadObjectACL
+	// PermissionWriteObjectACL permits setting object ACLs (s3:PutObjectAcl).
+	PermissionWriteObjectACL
+	// PermissionReadObjectVersionACL permits reading object-version ACLs (s3:GetObjectVersionAcl).
+	PermissionReadObjectVersionACL
+	// PermissionWriteObjectVersionACL permits setting object-version ACLs (s3:PutObjectVersionAcl).
+	PermissionWriteObjectVersionACL
+	// PermissionAbortMultipartUpload permits aborting multipart uploads (s3:AbortMultipartUpload).
+	PermissionAbortMultipartUpload
+	// PermissionListMultipartUploadParts permits listing uploaded parts (s3:ListMultipartUploadParts).
+	PermissionListMultipartUploadParts
+	// PermissionListMultipartUploads permits listing uploads in the entire bucket (s3:ListBucketMultipartUploads).
+	PermissionListMultipartUploads
+	// PermissionReadBucketACL permits reading the bucket ACL (s3:GetBucketAcl).
+	PermissionReadBucketACL
+	// PermissionWriteBucketACL permits setting the bucket ACL (s3:PutBucketAcl).
+	PermissionWriteBucketACL
+	// PermissionReadBucketCORS permits reading the bucket CORS configuration (s3:GetBucketCORS).
+	PermissionReadBucketCORS
+	// PermissionWriteBucketCORS permits setting the bucket CORS configuration (s3:PutBucketCORS).
+	PermissionWriteBucketCORS
+	// PermissionReadBucketVersioning permits reading the bucket versioning state (s3:GetBucketVersioning).
+	PermissionReadBucketVersioning
+	// PermissionWriteBucketVersioning permits setting the bucket versioning state (s3:PutBucketVersioning).
+	PermissionWriteBucketVersioning
+	// PermissionReadBucketWebsite permits reading the bucket website configuration (s3:GetBucketWebsite).
+	PermissionReadBucketWebsite
+	// PermissionWriteBucketWebsite permits setting the bucket website configuration (s3:PutBucketWebsite).
+	PermissionWriteBucketWebsite
+	// PermissionDeleteBucketWebsite permits deleting the bucket website configuration (s3:DeleteBucketWebsite).
+	PermissionDeleteBucketWebsite
+	// PermissionReadBucketEncryption permits reading the bucket encryption configuration (s3:GetEncryptionConfiguration).
+	PermissionReadBucketEncryption
+	// PermissionWriteBucketEncryption permits setting the bucket encryption configuration (s3:PutEncryptionConfiguration).
+	PermissionWriteBucketEncryption
+	// PermissionReadBucketLifecycle permits reading the bucket lifecycle rules (s3:GetLifecycleConfiguration).
+	PermissionReadBucketLifecycle
+	// PermissionWriteBucketLifecycle permits setting the bucket lifecycle rules (s3:PutLifecycleConfiguration).
+	PermissionWriteBucketLifecycle
 )
 
-const allPermissions = PermissionReadObject | PermissionListObjects | PermissionWriteObject | PermissionDeleteObject | PermissionMultipartUpload | PermissionBucketLocation
+// AllPermissions combines the individual flags for every supported action.
+// The overlapping PermissionMultipartUpload bundle is omitted so that individual
+// actions can be removed with &^. Bucket permissions still cover the entire
+// bucket when a non-empty object prefix is supplied.
+// Its value may grow when support for additional actions is added.
+const AllPermissions = PermissionReadObject | PermissionListObjects | PermissionWriteObject |
+	PermissionDeleteObject | PermissionBucketLocation |
+	PermissionReadObjectVersion | PermissionDeleteObjectVersion | PermissionListObjectVersions |
+	PermissionReadObjectACL | PermissionWriteObjectACL | PermissionReadObjectVersionACL |
+	PermissionWriteObjectVersionACL | PermissionAbortMultipartUpload | PermissionListMultipartUploadParts |
+	PermissionListMultipartUploads | PermissionReadBucketACL | PermissionWriteBucketACL |
+	PermissionReadBucketCORS | PermissionWriteBucketCORS | PermissionReadBucketVersioning |
+	PermissionWriteBucketVersioning | PermissionReadBucketWebsite | PermissionWriteBucketWebsite |
+	PermissionDeleteBucketWebsite | PermissionReadBucketEncryption | PermissionWriteBucketEncryption |
+	PermissionReadBucketLifecycle | PermissionWriteBucketLifecycle
+
+// supportedPermissions also accepts the original multipart-upload bundle bit.
+const supportedPermissions = AllPermissions | PermissionMultipartUpload
 
 // SessionPolicy is a validated, compact inline policy for ephemeral
 // credentials. Construct a SessionPolicy with [PrefixPolicy], [PrefixPolicies],
@@ -84,6 +153,8 @@ func RawPolicy(data []byte) (SessionPolicy, error) {
 // metacharacters, control characters, or invalid UTF-8.
 // Listing requests must use the prefix followed by a slash (or a deeper prefix)
 // so that similarly named sibling prefixes cannot be listed.
+// This applies to object and object-version listings. Bucket configuration
+// permissions and PermissionListMultipartUploads always cover the entire bucket.
 //
 // An empty prefix deliberately covers the whole bucket, so pass one only when
 // that is intended: an unset variable widens the policy rather than failing.
@@ -97,6 +168,8 @@ type PrefixGrant struct {
 	Bucket string
 	// Prefix is a literal object prefix with the same restrictions as [PrefixPolicy].
 	// An empty prefix deliberately covers the whole bucket.
+	// Bucket configuration permissions and PermissionListMultipartUploads are
+	// bucket-wide regardless of this value.
 	Prefix string
 	// Permissions must contain at least one supported permission.
 	Permissions Permissions
@@ -143,7 +216,7 @@ func prefixStatements(bucket, prefix string, permissions Permissions) ([]policyS
 		return nil, errors.New("create S3 prefix policy: at least one permission is required")
 	}
 
-	if unknown := permissions &^ allPermissions; unknown != 0 {
+	if unknown := permissions &^ supportedPermissions; unknown != 0 {
 		return nil, errors.New("create S3 prefix policy: unsupported permission bits 0x" + strconv.FormatUint(uint64(unknown), 16))
 	}
 
@@ -164,11 +237,15 @@ func prefixStatements(bucket, prefix string, permissions Permissions) ([]policyS
 
 	statements := make([]policyStatement, 0, 3)
 
-	if permissions&PermissionListObjects != 0 {
+	listActions := permissionActions(permissions, []permissionAction{
+		{PermissionListObjects, "s3:ListBucket"},
+		{PermissionListObjectVersions, "s3:ListBucketVersions"},
+	})
+	if len(listActions) != 0 {
 		statement := policyStatement{
 			Effect:    "Allow",
 			Principal: "*",
-			Action:    []string{"s3:ListBucket"},
+			Action:    listActions,
 			Resource:  []string{bucketARN},
 		}
 
@@ -181,32 +258,45 @@ func prefixStatements(bucket, prefix string, permissions Permissions) ([]policyS
 		statements = append(statements, statement)
 	}
 
-	if permissions&PermissionBucketLocation != 0 {
+	bucketActions := permissionActions(permissions, []permissionAction{
+		{PermissionBucketLocation, "s3:GetBucketLocation"},
+		{PermissionListMultipartUploads, "s3:ListBucketMultipartUploads"},
+		{PermissionReadBucketACL, "s3:GetBucketAcl"},
+		{PermissionWriteBucketACL, "s3:PutBucketAcl"},
+		{PermissionReadBucketCORS, "s3:GetBucketCORS"},
+		{PermissionWriteBucketCORS, "s3:PutBucketCORS"},
+		{PermissionReadBucketVersioning, "s3:GetBucketVersioning"},
+		{PermissionWriteBucketVersioning, "s3:PutBucketVersioning"},
+		{PermissionReadBucketWebsite, "s3:GetBucketWebsite"},
+		{PermissionWriteBucketWebsite, "s3:PutBucketWebsite"},
+		{PermissionDeleteBucketWebsite, "s3:DeleteBucketWebsite"},
+		{PermissionReadBucketEncryption, "s3:GetEncryptionConfiguration"},
+		{PermissionWriteBucketEncryption, "s3:PutEncryptionConfiguration"},
+		{PermissionReadBucketLifecycle, "s3:GetLifecycleConfiguration"},
+		{PermissionWriteBucketLifecycle, "s3:PutLifecycleConfiguration"},
+	})
+	if len(bucketActions) != 0 {
 		statements = append(statements, policyStatement{
 			Effect:    "Allow",
 			Principal: "*",
-			Action:    []string{"s3:GetBucketLocation"},
+			Action:    bucketActions,
 			Resource:  []string{bucketARN},
 		})
 	}
 
-	objectActions := make([]string, 0, 5)
-	if permissions&PermissionReadObject != 0 {
-		objectActions = append(objectActions, "s3:GetObject")
-	}
-
-	if permissions&(PermissionWriteObject|PermissionMultipartUpload) != 0 {
-		objectActions = append(objectActions, "s3:PutObject")
-	}
-
-	if permissions&PermissionDeleteObject != 0 {
-		objectActions = append(objectActions, "s3:DeleteObject")
-	}
-
-	if permissions&PermissionMultipartUpload != 0 {
-		objectActions = append(objectActions, "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts")
-	}
-
+	objectActions := permissionActions(permissions, []permissionAction{
+		{PermissionReadObject, "s3:GetObject"},
+		{PermissionWriteObject | PermissionMultipartUpload, "s3:PutObject"},
+		{PermissionDeleteObject, "s3:DeleteObject"},
+		{PermissionAbortMultipartUpload | PermissionMultipartUpload, "s3:AbortMultipartUpload"},
+		{PermissionListMultipartUploadParts | PermissionMultipartUpload, "s3:ListMultipartUploadParts"},
+		{PermissionReadObjectVersion, "s3:GetObjectVersion"},
+		{PermissionDeleteObjectVersion, "s3:DeleteObjectVersion"},
+		{PermissionReadObjectACL, "s3:GetObjectAcl"},
+		{PermissionWriteObjectACL, "s3:PutObjectAcl"},
+		{PermissionReadObjectVersionACL, "s3:GetObjectVersionAcl"},
+		{PermissionWriteObjectVersionACL, "s3:PutObjectVersionAcl"},
+	})
 	if len(objectActions) != 0 {
 		statements = append(statements, policyStatement{
 			Effect:    "Allow",
@@ -217,6 +307,23 @@ func prefixStatements(bucket, prefix string, permissions Permissions) ([]policyS
 	}
 
 	return statements, nil
+}
+
+type permissionAction struct {
+	permissions Permissions
+	action      string
+}
+
+// permissionActions emits each action once when any of its permission bits is set.
+func permissionActions(permissions Permissions, rules []permissionAction) []string {
+	actions := make([]string, 0, len(rules))
+	for _, rule := range rules {
+		if permissions&rule.permissions != 0 {
+			actions = append(actions, rule.action)
+		}
+	}
+
+	return actions
 }
 
 // validBucket applies the Object Storage DNS-style naming rules and rejects IPv4

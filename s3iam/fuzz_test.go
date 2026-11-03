@@ -46,8 +46,12 @@ func FuzzPrefixPolicy(f *testing.F) {
 		prefix      string
 		permissions uint32
 	}{
-		{"bucket", "prefix", uint32(allPermissions)},
+		{"bucket", "prefix", uint32(AllPermissions)},
+		{"bucket", "prefix", uint32(AllPermissions | PermissionMultipartUpload)},
 		{"bucket", "", uint32(PermissionReadObject)},
+		{"bucket", "tenant/42", uint32(PermissionReadObjectVersion | PermissionListObjectVersions)},
+		{"bucket", "tenant/42", uint32(PermissionAbortMultipartUpload | PermissionListMultipartUploadParts)},
+		{"bucket", "tenant/42", uint32(PermissionListMultipartUploads | PermissionWriteBucketLifecycle)},
 		{"bucket", "/nested/path/", uint32(PermissionListObjects)},
 		{"bad bucket", "prefix", uint32(PermissionReadObject)},
 		{"\x96", "0", uint32(PermissionReadObject)},      // invalid UTF-8 once rewrote the ARN

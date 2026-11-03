@@ -57,8 +57,7 @@ func (e *APIError) Temporary() bool {
 
 // retryAfterHint returns the server-requested delay carried by err, if any.
 func retryAfterHint(err error) time.Duration {
-	var apiErr *APIError
-	if errors.As(err, &apiErr) {
+	if apiErr, ok := errors.AsType[*APIError](err); ok {
 		return apiErr.RetryAfter
 	}
 
