@@ -4,7 +4,7 @@ go 1.27.0
 
 require (
 	github.com/jackc/pgx/v5 v5.12.0
-	github.com/skarm/ycauth v0.5.1
+	github.com/skarm/ycauth v0.5.2
 )
 
 require (

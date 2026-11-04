@@ -2,5 +2,5 @@ github.com/aws/aws-sdk-go-v2 v1.47.5 h1:5yA+A+BiXbDq1ZLbYwPViwhEGDMdR0MEhL8Jh2Ln
 github.com/aws/aws-sdk-go-v2 v1.47.5/go.mod h1:iNIkogrRvFwm+1OQIUOP2lPBtlXZboOIUWiCa+pHEMw=
 github.com/aws/smithy-go v1.28.8 h1:aEmdAq7gVCoGCnvf1NnELlu3I6D/nhqrC321FyFiQkQ=
 github.com/aws/smithy-go v1.28.8/go.mod h1:YE2RhdIuDbA5E5bTdciG9KrW3+TiEONeUWCqxX9i1Fc=
-github.com/skarm/ycauth v0.5.1 h1:aKumQhB2gvntpUnR8qOo0CLxAutlOlStmRUk3TVqfI0=
-github.com/skarm/ycauth v0.5.1/go.mod h1:8du5O6G3q4hyVilwxJrA4jW41i9sdMxPISb2nsKo/Ho=
+github.com/skarm/ycauth v0.5.2 h1:sf0lOWq8aG26fMud4FFQtHLO6z7ID44+oKKYqMZnuV0=
+github.com/skarm/ycauth v0.5.2/go.mod h1:v3fQ4YjkjMmPi+9BpNOZfZeUJK8jwlGBeQf+M7BtiIk=
