@@ -74,7 +74,9 @@ type CacheConfig struct {
 	// RefreshBefore starts a background refresh this long before expiration.
 	// Zero uses the default.
 	RefreshBefore time.Duration
-	// RefreshTimeout limits an individual refresh. Zero uses the default.
+	// RefreshTimeout limits how long the cache waits for an individual refresh.
+	// The source must honor its context to release its own goroutine and resources.
+	// Zero uses the default.
 	RefreshTimeout time.Duration
 	// MinRefreshInterval limits how often a valid token may be refreshed, as
 	// far as its lifetime allows: a token expiring sooner is refreshed as often
@@ -133,6 +135,9 @@ type tokenSnapshot struct {
 	// expiresIn keeps readers off the refresh lock until the scheduled expiry
 	// while a refresh is already in flight; ExpiresAt remains authoritative.
 	expiresIn time.Duration
+	// backoffErr lets callers without a valid token observe a failed refresh
+	// without contending on mu until refreshIn. Pending refreshes clear it.
+	backoffErr error
 }
 
 // newSnapshot describes token as of base, with the next lock-taking deadline.
@@ -217,9 +222,19 @@ func (c *Cache) Token(ctx context.Context) (Token, error) {
 				// serving the token we hold instead of blocking on the
 				// network.
 				_, _ = c.beginRefresh(now, current)
+
+				// Waiting for the refresh mutex can outlast the token. Recheck
+				// its absolute deadline before returning the old snapshot.
+				if !current.token.ValidAt(c.now()) {
+					continue
+				}
 			}
 
 			return current.token, nil
+		}
+
+		if current != nil && current.backoffErr != nil && now.Sub(current.base) < current.refreshIn {
+			return Token{}, current.backoffErr
 		}
 
 		call, err := c.beginRefresh(now, current)
@@ -289,6 +304,7 @@ func (c *Cache) beginRefresh(now time.Time, observed *tokenSnapshot) (*refreshCa
 	if observed != nil {
 		pending := *observed
 		pending.refreshIn = pending.expiresIn
+		pending.backoffErr = nil
 		c.current.Store(&pending)
 	}
 
@@ -374,13 +390,18 @@ func (c *Cache) publish(call *refreshCall, startedAt time.Time, token Token, err
 
 		if previous != nil && previous.token.ValidAt(finishedAt) {
 			// Serve the still-valid token without the lock until a retry is due.
-			c.current.Store(newSnapshot(previous.token, finishedAt, c.nextAttemptAt))
 			call.result.token = previous.token
 			event.ExpiresAt = previous.token.ExpiresAt
 			event.UsedStale = true
 		} else {
 			call.result.err = err
 		}
+
+		// An empty or expired cache also needs a lock-free backoff path: an
+		// outage must not serialize every caller on the refresh mutex.
+		snapshot := newSnapshot(call.result.token, finishedAt, c.nextAttemptAt)
+		snapshot.backoffErr = c.backoffErr
+		c.current.Store(snapshot)
 	}
 
 	c.refresh = nil

@@ -147,6 +147,64 @@ func TestCacheDoesNotServeTokenPastAbsoluteExpiration(t *testing.T) {
 	}
 }
 
+func TestCacheRechecksExpirationAfterRefreshLock(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)
+	clock := &fakeClock{now: now}
+	var calls atomic.Int64
+	var observeNow atomic.Bool
+	sampled := make(chan struct{}, 1)
+	cache, err := newCache(TokenSourceFunc(func(context.Context) (Token, error) {
+		if calls.Add(1) == 1 {
+			return Token{Value: "old", ExpiresAt: now.Add(time.Hour)}, nil
+		}
+		return Token{Value: "fresh", ExpiresAt: clock.Now().Add(time.Hour)}, nil
+	}), CacheConfig{}, func() time.Time {
+		instant := clock.Now()
+		if observeNow.CompareAndSwap(true, false) {
+			sampled <- struct{}{}
+		}
+		return instant
+	}, func() float64 { return 0.5 })
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := cache.Token(ctx); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(56 * time.Minute)
+
+	// Let the caller sample a valid token in its refresh window, then expire
+	// it while the caller is unable to acquire the refresh mutex.
+	cache.mu.Lock()
+	observeNow.Store(true)
+	result := make(chan tokenResult, 1)
+	go func() {
+		token, err := cache.Token(ctx)
+		result <- tokenResult{token: token, err: err}
+	}()
+	select {
+	case <-sampled:
+		clock.Advance(4 * time.Minute)
+	case <-ctx.Done():
+		cache.mu.Unlock()
+		t.Fatal("caller did not sample the cached token")
+	}
+	cache.mu.Unlock()
+
+	select {
+	case got := <-result:
+		if got.err != nil || got.token.Value != "fresh" || !got.token.ValidAt(clock.Now()) {
+			t.Fatalf("Token() = (%v, %v), want a token valid after the refresh lock", got.token, got.err)
+		}
+	case <-ctx.Done():
+		t.Fatal("Token() did not return after the refresh lock was released")
+	}
+}
+
 type waitHookContext struct {
 	context.Context
 	beforeWait func()
@@ -891,4 +949,71 @@ func BenchmarkCacheHitParallel(b *testing.B) {
 			}
 		}
 	})
+}
+
+func TestCacheBackoffWithoutValidTokenTakesNoLock(t *testing.T) {
+	t.Parallel()
+	for _, expired := range []bool{false, true} {
+		name := "empty"
+		if expired {
+			name = "expired"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			clock := &fakeClock{now: time.Date(2026, 11, 4, 0, 0, 0, 0, time.UTC)}
+			var calls atomic.Int64
+			cache, err := newCache(TokenSourceFunc(func(context.Context) (Token, error) {
+				n := calls.Add(1)
+				if expired && n == 1 {
+					return Token{Value: "old", ExpiresAt: clock.Now().Add(10 * time.Second)}, nil
+				}
+				failure := int64(1)
+				if expired {
+					failure++
+				}
+				if n == failure {
+					return Token{}, errors.New("IAM unavailable")
+				}
+				return Token{Value: "recovered", ExpiresAt: clock.Now().Add(time.Hour)}, nil
+			}), CacheConfig{Backoff: BackoffConfig{Initial: time.Second, Max: time.Second}}, clock.Now, func() float64 { return 0.5 })
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx := context.Background()
+			if expired {
+				if _, err := cache.Token(ctx); err != nil {
+					t.Fatal(err)
+				}
+				clock.Advance(11 * time.Second)
+			}
+			if _, err := cache.Token(ctx); err == nil || errors.Is(err, ErrBackoff) {
+				t.Fatalf("first failure = %v, want the live source error", err)
+			}
+			cache.mu.Lock()
+			done := make(chan error, 1)
+			go func() {
+				token, err := cache.Token(ctx)
+				if token != (Token{}) {
+					done <- errors.New("returned a token during failed refresh backoff")
+					return
+				}
+				done <- err
+			}()
+			select {
+			case err := <-done:
+				cache.mu.Unlock()
+				if !errors.Is(err, ErrBackoff) {
+					t.Fatalf("backoff error = %v", err)
+				}
+			case <-time.After(5 * time.Second):
+				cache.mu.Unlock()
+				<-done
+				t.Fatal("backoff reader waited for the refresh mutex")
+			}
+			clock.Advance(time.Second)
+			if token, err := cache.Token(ctx); err != nil || token.Value != "recovered" {
+				t.Fatalf("retry at backoff deadline = (%v, %v)", token, err)
+			}
+		})
+	}
 }

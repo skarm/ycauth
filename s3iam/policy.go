@@ -370,7 +370,7 @@ func validPrefix(prefix string) bool {
 
 	for _, character := range prefix {
 		if character == '*' || character == '?' || character == '$' ||
-			character == utf8.RuneError || unicode.IsControl(character) {
+			unicode.IsControl(character) {
 			return false
 		}
 	}

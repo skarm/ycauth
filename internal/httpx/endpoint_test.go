@@ -29,12 +29,16 @@ func TestValidateSecureEndpoint(t *testing.T) {
 	}
 
 	// Only IMDS may be reached over plain HTTP off-loopback.
-	const imds = "http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token"
-	if _, err := ValidateSecureEndpoint(imds); err == nil {
-		t.Error("ValidateSecureEndpoint(link-local) error = nil")
-	}
-	if got, err := ValidateIMDSEndpoint(imds); err != nil || got != imds {
-		t.Errorf("ValidateIMDSEndpoint(%q) = (%q, %v)", imds, got, err)
+	for _, endpoint := range []string{
+		"http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token",
+		"http://[fe80::1%25eth0]/token",
+	} {
+		if _, err := ValidateSecureEndpoint(endpoint); err == nil {
+			t.Errorf("ValidateSecureEndpoint(%q) error = nil", endpoint)
+		}
+		if got, err := ValidateIMDSEndpoint(endpoint); err != nil || got != endpoint {
+			t.Errorf("ValidateIMDSEndpoint(%q) = (%q, %v)", endpoint, got, err)
+		}
 	}
 	for _, endpoint := range []string{"http://iam.example.test/token", "http://169.254.169.254@evil.test/token"} {
 		if _, err := ValidateIMDSEndpoint(endpoint); err == nil {

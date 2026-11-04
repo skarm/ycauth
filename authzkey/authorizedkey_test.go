@@ -416,3 +416,39 @@ func TestNewJSONAcceptsPKCS8RSAAndRejectsOtherPEMData(t *testing.T) {
 		t.Fatal("NewJSON(EC key) error = nil")
 	}
 }
+
+func TestAcquireSkipsSigningAfterCancellation(t *testing.T) {
+	t.Parallel()
+	_, document := testKey()
+	for _, deadline := range []bool{false, true} {
+		name := "canceled"
+		if deadline {
+			name = "deadline exceeded"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			source, err := NewJSON(bytes.NewReader(document))
+			if err != nil {
+				t.Fatal(err)
+			}
+			source.now = func() time.Time {
+				t.Error("canceled acquisition reached JWT construction")
+				return time.Now()
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			wantErr := context.Canceled
+			if deadline {
+				cancel()
+				ctx, cancel = context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+				wantErr = context.DeadlineExceeded
+			}
+			defer cancel()
+			if !deadline {
+				cancel()
+			}
+			if token, err := source.Acquire(ctx); !errors.Is(err, wantErr) || token.Value != "" {
+				t.Fatalf("Acquire() = (%v, %v), want %v", token, err, wantErr)
+			}
+		})
+	}
+}

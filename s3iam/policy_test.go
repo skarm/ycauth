@@ -432,6 +432,30 @@ func TestPrefixPolicyListingStaysWithinObjectPrefix(t *testing.T) {
 	}
 }
 
+func TestPrefixPolicyPreservesLiteralUnicode(t *testing.T) {
+	t.Parallel()
+
+	const prefix = "tenant/\ufffd/файлы"
+	policy, err := PrefixPolicy("bucket", prefix, PermissionReadObject|PermissionListObjects)
+	if err != nil {
+		t.Fatalf("PrefixPolicy(valid UTF-8) error = %v", err)
+	}
+	var document policyDocument
+	if err := json.Unmarshal([]byte(policy.JSON()), &document); err != nil {
+		t.Fatal(err)
+	}
+	if len(document.Statement) != 2 {
+		t.Fatalf("policy = %s, want listing and object statements", policy.JSON())
+	}
+	wantPattern := prefix + "/*"
+	if got := document.Statement[0].Condition["StringLike"]["s3:prefix"]; !slices.Equal(got, []string{wantPattern}) {
+		t.Errorf("listing prefixes = %q, want %q", got, wantPattern)
+	}
+	if got := document.Statement[1].Resource; !slices.Equal(got, []string{"arn:aws:s3:::bucket/" + wantPattern}) {
+		t.Errorf("object resources = %q, want the literal Unicode prefix", got)
+	}
+}
+
 func TestPrefixPolicyRequiresExplicitPermissions(t *testing.T) {
 	t.Parallel()
 

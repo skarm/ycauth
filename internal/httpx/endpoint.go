@@ -2,7 +2,7 @@ package httpx
 
 import (
 	"errors"
-	"net"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -54,8 +54,8 @@ func localHost(host string, linkLocal bool) bool {
 		return true
 	}
 
-	address := net.ParseIP(host)
-	if address == nil {
+	address, err := netip.ParseAddr(host)
+	if err != nil {
 		return false
 	}
 

@@ -1,6 +1,7 @@
 package httpx
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -108,6 +109,10 @@ func retryAfter(value string, now time.Time) time.Duration {
 		default:
 			return time.Duration(seconds) * time.Second
 		}
+	} else if errors.Is(err, strconv.ErrRange) && strings.Trim(value, "0123456789") == "" {
+		// HTTP delay-seconds has no fixed integer width. A valid decimal
+		// larger than int64 must saturate just like any other excessive hint.
+		return maxRetryAfter
 	}
 
 	when, err := http.ParseTime(value)

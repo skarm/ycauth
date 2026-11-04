@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"time"
 
@@ -188,6 +189,23 @@ func (s *Source) Acquire(ctx context.Context) (ycauth.Token, error) {
 // acquireOnce reports retry=true only after an HTTP 200 response whose body
 // could not be decoded or did not contain a usable token.
 func (s *Source) acquireOnce(ctx context.Context) (ycauth.Token, bool, error) {
+	// RSA signing cannot be canceled once started. Avoid that work when the
+	// caller has already left, including before a retry of an invalid response.
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			// Keep the HTTP error shape, including URL normalization, for
+			// callers that inspect *url.Error as well as context errors.
+			request, requestErr := http.NewRequestWithContext(ctx, http.MethodPost, s.endpoint, nil)
+			if requestErr != nil {
+				return ycauth.Token{}, false, fmt.Errorf("create IAM token request: %w", requestErr)
+			}
+
+			return ycauth.Token{}, false, fmt.Errorf("exchange service-account JWT for IAM token: %w", &url.Error{
+				Op: "Post", URL: request.URL.String(), Err: context.Cause(ctx),
+			})
+		}
+	}
+
 	signed, err := s.signedJWT(s.now().UTC())
 	if err != nil {
 		return ycauth.Token{}, false, err

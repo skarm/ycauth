@@ -161,6 +161,7 @@ func TestRetryAfter(t *testing.T) {
 		// An untrusted hint must not be able to suspend refreshes for longer
 		// than maxRetryAfter, whether it arrives as seconds or as a date.
 		{value: "9223372036854775807", want: maxRetryAfter},
+		{value: "9223372036854775808", want: maxRetryAfter},
 		{value: "2592000", want: maxRetryAfter},
 		{value: now.AddDate(1, 0, 0).Format(http.TimeFormat), want: maxRetryAfter},
 		{value: "invalid", want: 0},
