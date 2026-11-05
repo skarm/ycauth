@@ -4,15 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/skarm/ycauth"
 )
 
@@ -43,7 +46,7 @@ func TestNewCachesCredentials(t *testing.T) {
 		if err := json.NewDecoder(request.Body).Decode(&requestPayload); err != nil {
 			return nil, err
 		}
-		if requestPayload.SubjectID != "subject" || requestPayload.SessionName != "session" || requestPayload.Duration != "3600s" || requestPayload.SessionPolicy != policy.JSON() {
+		if requestPayload.SubjectID != "subject" || !strings.HasPrefix(requestPayload.SessionName, "session-") || requestPayload.Duration != "3600s" || requestPayload.SessionPolicy != policy.JSON() {
 			return nil, errors.New("unexpected request body")
 		}
 		return jsonResponse(http.StatusOK, `{"accessKeyId":"access","secret":"secret","sessionToken":"session-token","expiresAt":`+strconv.Quote(now.Add(time.Hour).Format(time.RFC3339Nano))+`}`), nil
@@ -198,6 +201,7 @@ func TestNewValidation(t *testing.T) {
 	invalidConfigs := []Config{
 		{},
 		{SessionName: "bad session", SessionPolicy: policy},
+		{SessionName: strings.Repeat("x", 65), SessionPolicy: policy},
 		{SessionName: "session", SessionPolicy: policy, Duration: time.Minute},
 		{SessionName: "session", SessionPolicy: policy, Endpoint: "relative"},
 		{SessionName: "session", SessionPolicy: policy, Endpoint: "http://iam.example.test"},
@@ -218,19 +222,27 @@ func TestNewValidation(t *testing.T) {
 func TestNewOmitsEmptySessionPolicy(t *testing.T) {
 	t.Parallel()
 
-	provider, _, err := newCredentialsIssuer(ycauth.TokenProviderFunc(func(context.Context) (ycauth.Token, error) {
-		return ycauth.Token{}, nil
-	}), Config{SessionName: "session"})
+	now := time.Now().UTC()
+	client := &http.Client{Transport: transportFunc(func(request *http.Request) (*http.Response, error) {
+		var payload map[string]json.RawMessage
+		if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+			return nil, err
+		}
+		if _, exists := payload["policy"]; exists {
+			return nil, errors.New("request body unexpectedly contains policy")
+		}
+		return jsonResponse(http.StatusOK, `{"accessKeyId":"access","secret":"secret","sessionToken":"token","expiresAt":`+
+			strconv.Quote(now.Add(time.Hour).Format(time.RFC3339Nano))+`}`), nil
+	})}
+	provider, err := New(ycauth.TokenProviderFunc(func(context.Context) (ycauth.Token, error) {
+		return ycauth.Token{Value: "iam-token", ExpiresAt: now.Add(2 * time.Hour)}, nil
+	}), Config{SessionName: "session", HTTPClient: client})
 	if err != nil {
-		t.Fatalf("newCredentialsIssuer() error = %v", err)
+		t.Fatalf("New() error = %v", err)
 	}
 
-	var requestPayload map[string]json.RawMessage
-	if err := json.Unmarshal(provider.requestBody, &requestPayload); err != nil {
-		t.Fatalf("decode request body: %v", err)
-	}
-	if _, exists := requestPayload["policy"]; exists {
-		t.Fatalf("request body unexpectedly contains policy: %s", provider.requestBody)
+	if _, err := provider.Retrieve(t.Context()); err != nil {
+		t.Fatalf("Retrieve() error = %v", err)
 	}
 }
 
@@ -459,5 +471,280 @@ func TestIssuerCountsPanickingTokenProviderErrorOnce(t *testing.T) {
 	}
 	if provider.failures != 2 || calls.Load() != 2 {
 		t.Fatalf("after retry: failures = %d, source calls = %d, want 2 each", provider.failures, calls.Load())
+	}
+}
+
+func TestCacheRotationUsesFreshSigningKeys(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		tokenExpiresAt := time.Now().Add(12 * time.Hour)
+		var names []string
+		client := &http.Client{Transport: transportFunc(func(request *http.Request) (*http.Response, error) {
+			var payload createCredentialsRequest
+			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+				return nil, err
+			}
+			names = append(names, payload.SessionName)
+			// Model an issuer that reuses the access key ID for the same
+			// session name but rotates its secret on every issuance.
+			body, err := json.Marshal(createCredentialsResponse{
+				AccessKeyID:  payload.SessionName,
+				Secret:       fmt.Sprintf("secret-%d", len(names)),
+				SessionToken: fmt.Sprintf("token-%d", len(names)),
+				ExpiresAt:    time.Now().Add(MinDuration),
+			})
+			if err != nil {
+				return nil, err
+			}
+			return jsonResponse(http.StatusOK, string(body)), nil
+		})}
+		cache, err := New(ycauth.TokenProviderFunc(func(context.Context) (ycauth.Token, error) {
+			return ycauth.Token{Value: "iam-token", ExpiresAt: tokenExpiresAt}, nil
+		}), Config{SessionName: "orders-api", Duration: MinDuration, HTTPClient: client})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		sign := func(signer *v4.Signer, credentials aws.Credentials) string {
+			t.Helper()
+			request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "https://storage.yandexcloud.net/bucket/key", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := signer.SignHTTP(t.Context(), credentials, request, "UNSIGNED-PAYLOAD", "s3", "ru-central1", time.Now()); err != nil {
+				t.Fatal(err)
+			}
+			return request.Header.Get("Authorization")
+		}
+
+		signer := v4.NewSigner()
+		for rotation := range 3 {
+			credentials, err := cache.Retrieve(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got, want := sign(signer, credentials), sign(v4.NewSigner(), credentials); got != want {
+				t.Fatalf("rotation %d: cached signer used an obsolete signing key", rotation)
+			}
+			cached, err := cache.Retrieve(t.Context())
+			if err != nil || cached.AccessKeyID != credentials.AccessKeyID {
+				t.Fatalf("cached Retrieve() = (%#v, %v)", cached, err)
+			}
+			if len(names) != rotation+1 {
+				t.Fatalf("issuances = %d, want %d", len(names), rotation+1)
+			}
+			if rotation < 2 {
+				time.Sleep(MinDuration)
+			}
+		}
+		seen := make(map[string]bool)
+		for _, name := range names {
+			if !strings.HasPrefix(name, "orders-api-") || !validSessionName(name) || seen[name] {
+				t.Fatalf("invalid or reused session name %q", name)
+			}
+			seen[name] = true
+		}
+	})
+}
+
+func TestIssuerSessionNamesAreUniqueAcrossProviders(t *testing.T) {
+	t.Parallel()
+
+	for _, prefix := range []string{"a", "orders-api", strings.Repeat("x", 64)} {
+		t.Run(prefix, func(t *testing.T) {
+			t.Parallel()
+
+			synctest.Test(t, func(t *testing.T) {
+				seen := make(map[string]bool)
+				client := &http.Client{Transport: transportFunc(func(request *http.Request) (*http.Response, error) {
+					var payload createCredentialsRequest
+					if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+						return nil, err
+					}
+					name := payload.SessionName
+					index := strings.LastIndexByte(name, '-')
+					if index <= 0 || index == len(name)-1 || !strings.HasPrefix(prefix, name[:index]) || !validSessionName(name) {
+						return nil, fmt.Errorf("invalid session name %q for prefix %q", name, prefix)
+					}
+					if len(prefix) == 64 && len(name) != 64 {
+						return nil, fmt.Errorf("session name length = %d, want 64", len(name))
+					}
+					if seen[name] {
+						return nil, fmt.Errorf("reused session name %q", name)
+					}
+					seen[name] = true
+					body, err := json.Marshal(createCredentialsResponse{
+						AccessKeyID: "access", Secret: "secret", SessionToken: "token", ExpiresAt: time.Now().Add(time.Hour),
+					})
+					if err != nil {
+						return nil, err
+					}
+					return jsonResponse(http.StatusOK, string(body)), nil
+				})}
+				for range 2 {
+					issuer, _, err := newCredentialsIssuer(ycauth.TokenProviderFunc(func(context.Context) (ycauth.Token, error) {
+						return ycauth.Token{Value: "iam-token", ExpiresAt: time.Now().Add(2 * time.Hour)}, nil
+					}), Config{SessionName: prefix, HTTPClient: client})
+					if err != nil {
+						t.Fatal(err)
+					}
+					for range 2 {
+						if _, err := issuer.Retrieve(t.Context()); err != nil {
+							t.Fatal(err)
+						}
+					}
+				}
+			})
+		})
+	}
+}
+
+func TestObserverReportsRefreshAndStaleFallback(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		var events []RefreshEvent
+		var serviceExpiration time.Time
+		failed := false
+		client := &http.Client{Transport: transportFunc(func(*http.Request) (*http.Response, error) {
+			if failed {
+				return jsonResponse(http.StatusServiceUnavailable, "issuer unavailable"), nil
+			}
+			serviceExpiration = time.Now().Add(2 * time.Second)
+			body, err := json.Marshal(createCredentialsResponse{
+				AccessKeyID: "private-access", Secret: "private-secret", SessionToken: "private-session", ExpiresAt: serviceExpiration,
+			})
+			if err != nil {
+				return nil, err
+			}
+			return jsonResponse(http.StatusOK, string(body)), nil
+		})}
+		cache, err := New(ycauth.TokenProviderFunc(func(context.Context) (ycauth.Token, error) {
+			return ycauth.Token{Value: "private-iam", ExpiresAt: time.Now().Add(time.Hour)}, nil
+		}), Config{SessionName: "observed", HTTPClient: client, Observer: ObserverFunc(func(event RefreshEvent) {
+			events = append(events, event)
+		})})
+		if err != nil {
+			t.Fatal(err)
+		}
+		first, err := cache.Retrieve(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(events) != 1 || events[0].Err != nil || events[0].UsedStale || events[0].Failures != 0 ||
+			!events[0].ExpiresAt.Equal(serviceExpiration) || !strings.HasPrefix(events[0].SessionName, "observed-") {
+			t.Fatalf("success events = %+v", events)
+		}
+		if !first.Expires.Before(events[0].ExpiresAt) {
+			t.Fatal("observer must expose service expiration, not adjusted cache expiration")
+		}
+		if _, err := cache.Retrieve(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if len(events) != 1 {
+			t.Fatal("cache hit emitted an event")
+		}
+
+		failed = true
+		time.Sleep(1100 * time.Millisecond)
+		if _, err := cache.Retrieve(t.Context()); err != nil {
+			t.Fatalf("stale fallback: %v", err)
+		}
+		if len(events) != 2 || events[1].Err == nil || !events[1].UsedStale || events[1].Failures != 1 ||
+			!events[1].ExpiresAt.Equal(serviceExpiration) || events[1].SessionName == events[0].SessionName {
+			t.Fatalf("fallback events = %+v", events)
+		}
+		if _, err := cache.Retrieve(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if len(events) != 2 {
+			t.Fatal("backoff emitted a duplicate event")
+		}
+
+		time.Sleep(2 * time.Second)
+		if _, err := cache.Retrieve(t.Context()); err == nil {
+			t.Fatal("expired credentials were reused")
+		}
+		if len(events) != 3 || events[2].Err == nil || events[2].UsedStale || events[2].Failures != 2 || !events[2].ExpiresAt.IsZero() {
+			t.Fatalf("expired fallback events = %+v", events)
+		}
+		failed = false
+		time.Sleep(30 * time.Second)
+		if _, err := cache.Retrieve(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if len(events) != 4 || events[3].Err != nil || events[3].Failures != 0 || events[3].UsedStale {
+			t.Fatalf("recovery events = %+v", events)
+		}
+		for _, event := range events {
+			if event.FinishedAt.Before(event.StartedAt) {
+				t.Fatal("invalid refresh duration")
+			}
+		}
+		encoded, err := json.Marshal(events)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(encoded), "private-") {
+			t.Fatal("observer exposed credential material")
+		}
+	})
+}
+
+func TestObserverReportsIAMFailureOnce(t *testing.T) {
+	t.Parallel()
+	var events []RefreshEvent
+	wantErr := errors.New("IAM unavailable")
+	cache, err := New(ycauth.TokenProviderFunc(func(context.Context) (ycauth.Token, error) {
+		return ycauth.Token{}, wantErr
+	}), Config{SessionName: "observed", Observer: ObserverFunc(func(event RefreshEvent) { events = append(events, event) })})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cache.Retrieve(t.Context()); !errors.Is(err, wantErr) {
+		t.Fatalf("Retrieve() error = %v", err)
+	}
+	if _, err := cache.Retrieve(t.Context()); !errors.Is(err, ycauth.ErrBackoff) {
+		t.Fatalf("backoff error = %v", err)
+	}
+	if len(events) != 1 || !errors.Is(events[0].Err, wantErr) || events[0].SessionName != "" || events[0].Failures != 1 || events[0].UsedStale {
+		t.Fatalf("IAM failure events = %+v", events)
+	}
+}
+
+func TestObserverPanicDoesNotAffectCredentials(t *testing.T) {
+	t.Parallel()
+	for _, failed := range []bool{false, true} {
+		t.Run(strconv.FormatBool(failed), func(t *testing.T) {
+			t.Parallel()
+			var observations atomic.Int64
+			client := &http.Client{Transport: transportFunc(func(*http.Request) (*http.Response, error) {
+				if failed {
+					return jsonResponse(http.StatusServiceUnavailable, "issuer unavailable"), nil
+				}
+				body, err := json.Marshal(createCredentialsResponse{AccessKeyID: "access", Secret: "secret", SessionToken: "session", ExpiresAt: time.Now().Add(time.Hour)})
+				if err != nil {
+					return nil, err
+				}
+				return jsonResponse(http.StatusOK, string(body)), nil
+			})}
+			cache, err := New(ycauth.TokenProviderFunc(func(context.Context) (ycauth.Token, error) {
+				return ycauth.Token{Value: "iam", ExpiresAt: time.Now().Add(2 * time.Hour)}, nil
+			}), Config{SessionName: "observed", HTTPClient: client, Observer: ObserverFunc(func(RefreshEvent) {
+				observations.Add(1)
+				panic("observer failed")
+			})})
+			if err != nil {
+				t.Fatal(err)
+			}
+			credentials, err := cache.Retrieve(t.Context())
+			if (err != nil) != failed || credentials.HasKeys() == failed {
+				t.Fatalf("Retrieve() = (%#v, %v)", credentials, err)
+			}
+			if observations.Load() != 1 {
+				t.Fatal("observer was not called once")
+			}
+		})
 	}
 }

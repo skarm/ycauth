@@ -6,6 +6,7 @@ package s3iam
 import (
 	"bytes"
 	"context"
+	cryptorand "crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -51,11 +52,43 @@ var failureBackoff = backoff.Policy{
 	Jitter:     0.2,
 }
 
+// RefreshEvent describes a credentials issuance without exposing key material.
+type RefreshEvent struct {
+	// StartedAt and FinishedAt bound the refresh, including IAM-token lookup.
+	StartedAt  time.Time
+	FinishedAt time.Time
+	// SessionName is the generated name, or empty if no name was generated.
+	SessionName string
+	// ExpiresAt is the real service expiration of the new or reused credentials.
+	// It is zero when the refresh failed without a usable fallback.
+	ExpiresAt time.Time
+	// Err is the refresh error, including when previous credentials are reused.
+	Err error
+	// Failures counts consecutive failed issuance attempts; success resets it.
+	Failures int
+	// UsedStale reports that the cache reused previous, still-valid credentials.
+	UsedStale bool
+}
+
+// Observer receives completed credentials refreshes on the refresh goroutine.
+// Implementations must return promptly and must not retrieve credentials from
+// the same cache. Observer panics are recovered.
+type Observer interface {
+	ObserveRefresh(RefreshEvent)
+}
+
+// ObserverFunc adapts a function to Observer.
+type ObserverFunc func(RefreshEvent)
+
+// ObserveRefresh calls f with event.
+func (f ObserverFunc) ObserveRefresh(event RefreshEvent) { f(event) }
+
 // Config configures the ephemeral S3 credentials returned by [New]. Its zero
 // value is invalid because [Config.SessionName] is required.
 type Config struct {
-	// SessionName identifies the ephemeral credentials session. It must contain
-	// 1 to 64 AWS-compatible session-name characters.
+	// SessionName is the prefix for ephemeral credentials session names. It must
+	// contain 1 to 64 AWS-compatible session-name characters. Each issuance adds
+	// a random suffix, truncating the prefix if needed to fit the 64-character limit.
 	SessionName string
 	// SubjectID optionally identifies the session subject. It must be valid UTF-8
 	// and contain at most 50 characters.
@@ -86,6 +119,9 @@ type Config struct {
 	// Zero uses ten seconds. The AWS credentials cache lets a shared refresh
 	// outlive the caller that triggered it.
 	RefreshTimeout time.Duration
+	// Observer receives issuance results, including failed refreshes that reuse
+	// valid credentials. Cache hits and attempts suppressed by backoff emit no event.
+	Observer Observer
 }
 
 // credentialsIssuer obtains credentials and implements the AWS cache strategies
@@ -96,9 +132,9 @@ type credentialsIssuer struct {
 	endpoint       string
 	userAgent      string
 	refreshTimeout time.Duration
-	// requestBody is constant for the issuer lifetime, so construction encodes it
-	// once instead of on every refresh.
-	requestBody  []byte
+	observer       Observer
+	// request is a template copied for each issuance to add a fresh session name.
+	request      createCredentialsRequest
 	now          func() time.Time
 	jitterSource func() float64
 
@@ -122,6 +158,17 @@ type createCredentialsResponse struct {
 	SessionToken string    `json:"sessionToken"`
 	ExpiresAt    time.Time `json:"expiresAt"`
 }
+
+// refreshError carries an issuance event until the AWS cache decides whether
+// previous credentials can be reused.
+type refreshError struct {
+	err   error
+	event RefreshEvent
+}
+
+func (e *refreshError) Error() string { return e.err.Error() }
+
+func (e *refreshError) Unwrap() error { return e.err }
 
 var (
 	_ aws.CredentialsProvider                       = (*credentialsIssuer)(nil)
@@ -204,14 +251,11 @@ func newCredentialsIssuer(tokenProvider ycauth.TokenProvider, config Config) (*c
 		return nil, 0, errors.New(errPrefix + "refresh timeout must be non-negative")
 	}
 
-	requestBody, err := json.Marshal(createCredentialsRequest{
+	request := createCredentialsRequest{
 		SubjectID:     subjectID,
 		SessionName:   sessionName,
 		SessionPolicy: config.SessionPolicy.document,
 		Duration:      strconv.FormatInt(int64(duration/time.Second), 10) + "s",
-	})
-	if err != nil {
-		return nil, 0, fmt.Errorf(errPrefix+"encode request: %w", err)
 	}
 
 	return &credentialsIssuer{
@@ -220,7 +264,8 @@ func newCredentialsIssuer(tokenProvider ycauth.TokenProvider, config Config) (*c
 		endpoint:       endpoint,
 		userAgent:      httpx.UserAgent(config.UserAgent),
 		refreshTimeout: refreshTimeout,
-		requestBody:    requestBody,
+		observer:       config.Observer,
+		request:        request,
 		now:            time.Now,
 		jitterSource:   rand.Float64,
 	}, expiryWindow, nil
@@ -251,16 +296,40 @@ func validSessionName(name string) bool {
 // credentials cache's shared refresh goroutine and converts a panic from the
 // token provider or HTTP transport to an error.
 func (p *credentialsIssuer) Retrieve(ctx context.Context) (credentials aws.Credentials, err error) {
+	event := RefreshEvent{StartedAt: p.now()}
+	attempted := false
+
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			credentials = aws.Credentials{}
 			err = p.recordFailure(fmt.Errorf("create ephemeral S3 credentials: refresh panicked: %v", recovered))
 		}
+
+		if !attempted || p.observer == nil {
+			return
+		}
+
+		event.FinishedAt = p.now()
+		if err == nil {
+			event.ExpiresAt = credentials.Expires
+			p.observe(event)
+
+			return
+		}
+
+		p.mu.Lock()
+		event.Failures = p.failures
+		p.mu.Unlock()
+
+		event.Err = err
+		err = &refreshError{err: err, event: event}
 	}()
 
 	if suppressed := p.suppressedErr(); suppressed != nil {
 		return aws.Credentials{}, suppressed
 	}
+
+	attempted = true
 
 	ctx, cancel := context.WithTimeout(ctx, p.refreshTimeout)
 	defer cancel()
@@ -270,7 +339,18 @@ func (p *credentialsIssuer) Retrieve(ctx context.Context) (credentials aws.Crede
 		return aws.Credentials{}, p.recordFailure(fmt.Errorf("get IAM token for ephemeral S3 credentials: %w", err))
 	}
 
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, p.endpoint, bytes.NewReader(p.requestBody))
+	payload := p.request
+	suffix := cryptorand.Text()
+	prefixLength := min(len(payload.SessionName), maxSessionNameLen-len(suffix)-1)
+	payload.SessionName = payload.SessionName[:prefixLength] + "-" + suffix
+	event.SessionName = payload.SessionName
+
+	requestBody, err := json.Marshal(payload)
+	if err != nil {
+		return aws.Credentials{}, p.recordFailure(fmt.Errorf("encode ephemeral S3 credentials request: %w", err))
+	}
+
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, p.endpoint, bytes.NewReader(requestBody))
 	if err != nil {
 		return aws.Credentials{}, p.recordFailure(fmt.Errorf("create ephemeral S3 credentials request: %w", err))
 	}
@@ -381,13 +461,36 @@ func retryAfterHint(err error) time.Duration {
 // expiration time, never merely until the cache's adjusted expiration.
 func (p *credentialsIssuer) HandleFailToRefresh(_ context.Context, previous aws.Credentials, refreshErr error) (aws.Credentials, error) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 
+	var fallback aws.Credentials
 	if previous.HasKeys() && p.lastIssuedCredentials.AccessKeyID == previous.AccessKeyID && p.lastIssuedCredentials.Expires.After(p.now()) {
-		return p.lastIssuedCredentials, nil
+		fallback = p.lastIssuedCredentials
+	}
+	p.mu.Unlock()
+
+	if failure, ok := errors.AsType[*refreshError](refreshErr); ok {
+		event := failure.event
+		event.UsedStale = fallback.HasKeys()
+		event.ExpiresAt = fallback.Expires
+		p.observe(event)
+	}
+
+	if fallback.HasKeys() {
+		return fallback, nil
 	}
 
 	return aws.Credentials{}, refreshErr
+}
+
+// observe contains observer panics without affecting refresh or backoff.
+func (p *credentialsIssuer) observe(event RefreshEvent) {
+	if p.observer == nil {
+		return
+	}
+
+	defer func() { _ = recover() }()
+
+	p.observer.ObserveRefresh(event)
 }
 
 // AdjustExpiresBy makes a failed refresh retry after backoff while preserving

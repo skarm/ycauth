@@ -197,10 +197,22 @@ to the subject. `Duration` must be a whole number of seconds from 15 minutes
 through 12 hours; zero selects one hour. `RefreshTimeout` limits the whole
 refresh, including IAM-token lookup, and defaults to ten seconds.
 
+`SessionName` is an application prefix, not a fixed session identifier. Each
+credentials issuance, including refreshes, appends a cryptographically random
+suffix. The prefix must contain 1 to 64 AWS-compatible session-name characters;
+it is truncated when necessary to keep the complete name within 64 characters.
+
 The AWS cache refreshes early. Yandex Cloud may cap an ephemeral key by the
 remaining IAM-token lifetime, so `s3iam` clamps its early-refresh window to the
 actual credentials lifetime. It never treats the adjusted AWS-cache expiration
 as the real key expiration.
+
+Set `Config.Observer` to receive `s3iam.RefreshEvent` for each issuance attempt.
+Events include the generated session name, timing, the real service expiration,
+the refresh error and failure count, and whether the cache reused still-valid
+credentials after a failure (`UsedStale`). Cache hits and attempts suppressed by
+backoff emit no event. Callbacks run inline, must return promptly, and must not
+retrieve credentials from the same cache. Observer panics are recovered.
 
 ### Least-privilege policy
 
