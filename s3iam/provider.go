@@ -1,6 +1,7 @@
 // Package s3iam creates and caches ephemeral Yandex Object Storage credentials
 // for the AWS SDK for Go v2. [New] returns an [aws.CredentialsCache] ready for
-// use as [aws.Config.Credentials].
+// use as [aws.Config.Credentials]. Set s3.Options.HTTPSignerV4 to [Signer] to
+// support secret rotation when the access key ID stays the same.
 package s3iam
 
 import (
@@ -177,7 +178,8 @@ var (
 )
 
 // New creates a cached AWS credentials provider using tokenProvider. Assign the
-// returned cache directly to [aws.Config.Credentials].
+// returned cache directly to [aws.Config.Credentials] and use [Signer] as the
+// S3 client's HTTPSignerV4 so rotated secrets do not reuse obsolete signing keys.
 //
 // New returns an error if tokenProvider is nil or config is invalid.
 func New(tokenProvider ycauth.TokenProvider, config Config) (*aws.CredentialsCache, error) {

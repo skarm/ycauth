@@ -199,7 +199,18 @@ if err != nil {
 }
 
 awsConfig.Credentials = credentials
+client := s3.NewFromConfig(awsConfig, func(options *s3.Options) {
+	options.HTTPSignerV4 = s3iam.Signer{}
+})
 ```
+
+Для IAM-ключей используйте `s3iam.Signer`. Yandex может менять `SecretAccessKey`
+и `SessionToken`, сохраняя прежний `AccessKeyID`. Стандартный SigV4 signer AWS SDK
+кеширует производные ключи без сравнения секрета, поэтому долгоживущий клиент
+может отправлять неверные подписи после обновления credentials. `s3iam.Signer`
+создаёт новый AWS signer на каждый запрос, сохраняя правила экранирования пути
+S3 и параметры подписи, переданные при вызове. Изменение `SessionName` не
+сбрасывает кеш ключей подписи.
 
 Обязательно только поле `SessionName`. `SessionPolicy` опционально: без него
 временные учётные данные получают все права Object Storage, уже выданные

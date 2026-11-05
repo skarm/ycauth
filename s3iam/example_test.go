@@ -10,6 +10,7 @@ import (
 	"github.com/skarm/ycauth/s3iam"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
 func ExampleNew() {
@@ -30,7 +31,10 @@ func ExampleNew() {
 	}
 
 	config := aws.Config{Credentials: credentials}
-	_ = config
+	client := s3.NewFromConfig(config, func(options *s3.Options) {
+		options.HTTPSignerV4 = s3iam.Signer{}
+	})
+	_ = client
 }
 
 func ExamplePrefixPolicies() {

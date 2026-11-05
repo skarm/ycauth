@@ -189,7 +189,17 @@ if err != nil {
 }
 
 awsConfig.Credentials = credentials
+client := s3.NewFromConfig(awsConfig, func(options *s3.Options) {
+	options.HTTPSignerV4 = s3iam.Signer{}
+})
 ```
+
+Use `s3iam.Signer` for IAM credentials. Yandex can rotate `SecretAccessKey` and
+`SessionToken` while keeping the same `AccessKeyID`. The AWS SDK's default SigV4
+signer caches derived keys without comparing the secret, so a long-lived client
+can otherwise send invalid signatures after a refresh. `s3iam.Signer` creates a
+fresh AWS signer for each request and preserves S3 path escaping and per-call
+signer options. Changing `SessionName` does not invalidate the signing-key cache.
 
 Only `SessionName` is required. `SessionPolicy` is optional; when omitted, the
 ephemeral credentials can use every Object Storage permission already granted

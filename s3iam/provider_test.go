@@ -16,6 +16,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/aws/signer/v4"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/skarm/ycauth"
 )
 
@@ -479,19 +480,19 @@ func TestCacheRotationUsesFreshSigningKeys(t *testing.T) {
 
 	synctest.Test(t, func(t *testing.T) {
 		tokenExpiresAt := time.Now().Add(12 * time.Hour)
-		var names []string
-		client := &http.Client{Transport: transportFunc(func(request *http.Request) (*http.Response, error) {
-			var payload createCredentialsRequest
-			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
-				return nil, err
+		var issuances int
+		var issued aws.Credentials
+		client := &http.Client{Transport: transportFunc(func(*http.Request) (*http.Response, error) {
+			issuances++
+			issued = aws.Credentials{
+				AccessKeyID:     "fixed-access-key-id",
+				SecretAccessKey: fmt.Sprintf("secret-%d", issuances),
+				SessionToken:    fmt.Sprintf("token-%d", issuances),
 			}
-			names = append(names, payload.SessionName)
-			// Model an issuer that reuses the access key ID for the same
-			// session name but rotates its secret on every issuance.
 			body, err := json.Marshal(createCredentialsResponse{
-				AccessKeyID:  payload.SessionName,
-				Secret:       fmt.Sprintf("secret-%d", len(names)),
-				SessionToken: fmt.Sprintf("token-%d", len(names)),
+				AccessKeyID:  issued.AccessKeyID,
+				Secret:       issued.SecretAccessKey,
+				SessionToken: issued.SessionToken,
 				ExpiresAt:    time.Now().Add(MinDuration),
 			})
 			if err != nil {
@@ -506,44 +507,50 @@ func TestCacheRotationUsesFreshSigningKeys(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		sign := func(signer *v4.Signer, credentials aws.Credentials) string {
-			t.Helper()
-			request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "https://storage.yandexcloud.net/bucket/key", nil)
+		// Validate the outgoing signature using the latest issued secret,
+		// independently of the long-lived client's signing-key cache.
+		storageHTTP := &http.Client{Transport: transportFunc(func(request *http.Request) (*http.Response, error) {
+			if request.Header.Get("X-Amz-Security-Token") != issued.SessionToken {
+				return nil, errors.New("S3 request used an obsolete session token")
+			}
+			signedAt, err := time.Parse("20060102T150405Z", request.Header.Get("X-Amz-Date"))
 			if err != nil {
-				t.Fatal(err)
+				return nil, err
 			}
-			if err := signer.SignHTTP(t.Context(), credentials, request, "UNSIGNED-PAYLOAD", "s3", "ru-central1", time.Now()); err != nil {
-				t.Fatal(err)
+			expected := request.Clone(request.Context())
+			expected.Header.Del("Authorization")
+			signer := v4.NewSigner(func(options *v4.SignerOptions) { options.DisableURIPathEscaping = true })
+			if err := signer.SignHTTP(request.Context(), issued, expected,
+				request.Header.Get("X-Amz-Content-Sha256"), "s3", "ru-central1", signedAt); err != nil {
+				return nil, err
 			}
-			return request.Header.Get("Authorization")
-		}
+			if request.Header.Get("Authorization") != expected.Header.Get("Authorization") {
+				return nil, errors.New("S3 request used an obsolete signing key or incorrect path escaping")
+			}
+			return jsonResponse(http.StatusOK, ""), nil
+		})}
+		storage := s3.NewFromConfig(aws.Config{
+			Region: "ru-central1", Credentials: cache, HTTPClient: storageHTTP,
+			BaseEndpoint: aws.String("https://storage.yandexcloud.net"),
+			Retryer:      func() aws.Retryer { return aws.NopRetryer{} },
+		}, func(options *s3.Options) {
+			options.UsePathStyle = true
+			options.HTTPSignerV4 = Signer{}
+		})
 
-		signer := v4.NewSigner()
 		for rotation := range 3 {
-			credentials, err := cache.Retrieve(t.Context())
+			_, err := storage.HeadObject(t.Context(), &s3.HeadObjectInput{
+				Bucket: aws.String("bucket"), Key: aws.String("folder/a b+файл.txt"),
+			})
 			if err != nil {
-				t.Fatal(err)
+				t.Fatalf("rotation %d: HeadObject() error = %v", rotation, err)
 			}
-			if got, want := sign(signer, credentials), sign(v4.NewSigner(), credentials); got != want {
-				t.Fatalf("rotation %d: cached signer used an obsolete signing key", rotation)
-			}
-			cached, err := cache.Retrieve(t.Context())
-			if err != nil || cached.AccessKeyID != credentials.AccessKeyID {
-				t.Fatalf("cached Retrieve() = (%#v, %v)", cached, err)
-			}
-			if len(names) != rotation+1 {
-				t.Fatalf("issuances = %d, want %d", len(names), rotation+1)
+			if issuances != rotation+1 {
+				t.Fatalf("issuances = %d, want %d", issuances, rotation+1)
 			}
 			if rotation < 2 {
 				time.Sleep(MinDuration)
 			}
-		}
-		seen := make(map[string]bool)
-		for _, name := range names {
-			if !strings.HasPrefix(name, "orders-api-") || !validSessionName(name) || seen[name] {
-				t.Fatalf("invalid or reused session name %q", name)
-			}
-			seen[name] = true
 		}
 	})
 }
