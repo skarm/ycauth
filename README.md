@@ -218,11 +218,11 @@ actual credentials lifetime. It never treats the adjusted AWS-cache expiration
 as the real key expiration.
 
 Set `Config.Observer` to receive `s3iam.RefreshEvent` for each issuance attempt.
-Events include the generated session name, timing, the real service expiration,
-the refresh error and failure count, and whether the cache reused still-valid
-credentials after a failure (`UsedStale`). Cache hits and attempts suppressed by
-backoff emit no event. Callbacks run inline, must return promptly, and must not
-retrieve credentials from the same cache. Observer panics are recovered.
+Events include the generated session name, timing, the expiration capped by the
+IAM token, the refresh error and failure count, and whether the cache reused
+still-valid credentials after a failure (`UsedStale`). Cache hits and attempts
+suppressed by backoff emit no event. Callbacks run inline, must return promptly,
+and must not retrieve credentials from the same cache. Observer panics are recovered.
 
 ### Least-privilege policy
 

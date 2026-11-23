@@ -43,6 +43,7 @@ const (
 	maxSubjectIDLen       = 50
 	maxResponseBodySize   = int64(64 << 10)
 	credentialsSource     = "yc-ephemeral"
+	maxExpirationOverrun  = time.Millisecond
 )
 
 //nolint:gochecknoglobals // immutable retry policy shared by every credentials issuer.
@@ -60,7 +61,8 @@ type RefreshEvent struct {
 	FinishedAt time.Time
 	// SessionName is the generated name, or empty if no name was generated.
 	SessionName string
-	// ExpiresAt is the real service expiration of the new or reused credentials.
+	// ExpiresAt is the expiration of the new or reused credentials after applying
+	// the IAM token's deadline, before any early-refresh adjustment.
 	// It is zero when the refresh failed without a usable fallback.
 	ExpiresAt time.Time
 	// Err is the refresh error, including when previous credentials are reused.
@@ -126,7 +128,7 @@ type Config struct {
 }
 
 // credentialsIssuer obtains credentials and implements the AWS cache strategies
-// that preserve service expiration across early refresh and failure backoff.
+// that preserve the credentials' expiration across early refresh and failure backoff.
 type credentialsIssuer struct {
 	tokenProvider  ycauth.TokenProvider
 	client         *http.Client
@@ -379,13 +381,17 @@ func (p *credentialsIssuer) Retrieve(ctx context.Context) (credentials aws.Crede
 		return aws.Credentials{}, p.recordFailure(errors.New("decode ephemeral S3 credentials response: required fields are missing"))
 	}
 
-	// ExpiresAt is authoritative. Duration is a requested lifetime, not a
-	// client-side upper bound guaranteed by the API. The service does guarantee
-	// that credentials do not outlive the IAM token which authorized them.
+	// Allow a small timestamp discrepancy, with the IAM token's deadline as
+	// the upper bound for the credentials' expiration.
 	now := p.now()
 	tokenExpiresAt := token.ExpiresAt.Round(0)
+	expiresAt := result.ExpiresAt
 
-	if !result.ExpiresAt.After(now) || result.ExpiresAt.After(tokenExpiresAt) {
+	if tokenExpiresAt.Before(expiresAt) {
+		expiresAt = tokenExpiresAt
+	}
+
+	if !expiresAt.After(now) || result.ExpiresAt.Sub(tokenExpiresAt) > maxExpirationOverrun {
 		return aws.Credentials{}, p.recordFailure(fmt.Errorf(
 			"decode ephemeral S3 credentials response: expiration %s is outside (%s, %s]",
 			result.ExpiresAt.Format(time.RFC3339Nano),
@@ -399,7 +405,7 @@ func (p *credentialsIssuer) Retrieve(ctx context.Context) (credentials aws.Crede
 		SecretAccessKey: result.Secret,
 		SessionToken:    result.SessionToken,
 		CanExpire:       true,
-		Expires:         result.ExpiresAt,
+		Expires:         expiresAt,
 		Source:          credentialsSource,
 	}
 
@@ -421,8 +427,8 @@ func (p *credentialsIssuer) suppressedErr() error {
 	return nil
 }
 
-// recordSuccess clears refresh backoff and preserves the credentials' actual
-// service expiration for stale fallback.
+// recordSuccess clears refresh backoff and preserves the credentials' expiration
+// for stale fallback.
 func (p *credentialsIssuer) recordSuccess(credentials aws.Credentials) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -459,8 +465,8 @@ func retryAfterHint(err error) time.Duration {
 	return 0
 }
 
-// HandleFailToRefresh permits stale fallback only until the server-provided
-// expiration time, never merely until the cache's adjusted expiration.
+// HandleFailToRefresh permits stale fallback until the credentials' expiration
+// before the early-refresh adjustment.
 func (p *credentialsIssuer) HandleFailToRefresh(_ context.Context, previous aws.Credentials, refreshErr error) (aws.Credentials, error) {
 	p.mu.Lock()
 
@@ -496,7 +502,7 @@ func (p *credentialsIssuer) observe(event RefreshEvent) {
 }
 
 // AdjustExpiresBy makes a failed refresh retry after backoff while preserving
-// the real server expiration as the hard upper bound.
+// the credentials' expiration as the hard upper bound.
 func (p *credentialsIssuer) AdjustExpiresBy(credentials aws.Credentials, duration time.Duration) (aws.Credentials, error) {
 	now := p.now()
 	adjusted := credentials.Expires.Add(duration)

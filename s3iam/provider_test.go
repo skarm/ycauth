@@ -350,36 +350,57 @@ func TestIssuerAcceptsServiceExpirationBeyondRequestedLifetime(t *testing.T) {
 	}
 }
 
-func TestIssuerRejectsCredentialsBeyondTokenLifetime(t *testing.T) {
+func TestIssuerExpirationAgainstTokenLifetime(t *testing.T) {
 	t.Parallel()
 
 	now := time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)
-	policy, err := PrefixPolicy("bucket", "", PermissionReadObject)
-	if err != nil {
-		t.Fatalf("PrefixPolicy() error = %v", err)
-	}
-	tokenExpiresAt := now.Add(20 * time.Minute)
-	body := `{"accessKeyId":"access","secret":"secret","sessionToken":"token","expiresAt":` +
-		strconv.Quote(tokenExpiresAt.Add(time.Nanosecond).Format(time.RFC3339Nano)) + `}`
-	client := &http.Client{Transport: transportFunc(func(*http.Request) (*http.Response, error) {
-		return jsonResponse(http.StatusOK, body), nil
-	})}
-	provider, _, err := newCredentialsIssuer(ycauth.TokenProviderFunc(func(context.Context) (ycauth.Token, error) {
-		return ycauth.Token{Value: "iam", ExpiresAt: tokenExpiresAt}, nil
-	}), Config{
-		SessionName:   "session",
-		Duration:      time.Hour,
-		SessionPolicy: policy,
-		Endpoint:      "https://iam.example.test",
-		HTTPClient:    client,
-	})
-	if err != nil {
-		t.Fatalf("newCredentialsIssuer() error = %v", err)
-	}
-	provider.now = func() time.Time { return now }
+	tokenLifetime := 20*time.Minute - time.Microsecond
+	for _, testCase := range []struct {
+		name          string
+		tokenLifetime time.Duration
+		overrun       time.Duration
+		wantLifetime  time.Duration
+		wantError     bool
+	}{
+		{name: "earlier expiration", tokenLifetime: tokenLifetime, overrun: -time.Second, wantLifetime: tokenLifetime - time.Second},
+		{name: "equal expiration", tokenLifetime: tokenLifetime, wantLifetime: tokenLifetime},
+		{name: "five microseconds over", tokenLifetime: tokenLifetime, overrun: 5 * time.Microsecond, wantLifetime: tokenLifetime},
+		{name: "at tolerance", tokenLifetime: tokenLifetime, overrun: time.Millisecond, wantLifetime: tokenLifetime},
+		{name: "beyond tolerance", tokenLifetime: tokenLifetime, overrun: time.Millisecond + time.Nanosecond, wantError: true},
+		{name: "IAM token already expired", overrun: 5 * time.Microsecond, wantError: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
 
-	if _, err := provider.Retrieve(context.Background()); err == nil {
-		t.Fatal("Retrieve() error = nil")
+			tokenExpiresAt := now.Add(testCase.tokenLifetime)
+			body := `{"accessKeyId":"access","secret":"secret","sessionToken":"token","expiresAt":` +
+				strconv.Quote(tokenExpiresAt.Add(testCase.overrun).Format(time.RFC3339Nano)) + `}`
+			client := &http.Client{Transport: transportFunc(func(*http.Request) (*http.Response, error) {
+				return jsonResponse(http.StatusOK, body), nil
+			})}
+			provider, _, err := newCredentialsIssuer(ycauth.TokenProviderFunc(func(context.Context) (ycauth.Token, error) {
+				return ycauth.Token{Value: "iam", ExpiresAt: tokenExpiresAt}, nil
+			}), Config{SessionName: "session", Endpoint: "https://iam.example.test", HTTPClient: client})
+			if err != nil {
+				t.Fatalf("newCredentialsIssuer() error = %v", err)
+			}
+			provider.now = func() time.Time { return now }
+
+			credentials, err := provider.Retrieve(t.Context())
+			if testCase.wantError {
+				if err == nil || !strings.Contains(err.Error(), "expiration") || credentials.HasKeys() {
+					t.Fatalf("Retrieve() got credentials = %t, error = %v, want an expiration error without credentials", credentials.HasKeys(), err)
+				}
+
+				return
+			}
+			if err != nil {
+				t.Fatalf("Retrieve() error = %v", err)
+			}
+			if want := now.Add(testCase.wantLifetime); !credentials.Expires.Equal(want) {
+				t.Errorf("credentials.Expires = %s, want %s", credentials.Expires.Format(time.RFC3339Nano), want.Format(time.RFC3339Nano))
+			}
+		})
 	}
 }
 
